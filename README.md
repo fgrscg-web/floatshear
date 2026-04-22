@@ -35,19 +35,18 @@ rcParams['axes.unicode_minus'] = False
 
 
 # =========================================================================
-# [디버깅 팝업] D단계 시각화: 가상 슬릿 위치 + 적분 경로 + q₀ 분포
+# [디버깅 팝업] 행렬 기반 최종 전단류(q_final) 분포 시각화
 # =========================================================================
 class ShearFlowPathDialog(QDialog):
-    def __init__(self, graph_edges, graph_nodes, root_node, parent=None):
+    def __init__(self, graph_edges, graph_nodes, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("디버깅: 가상 슬릿 배치 및 q₀(정정 전단류) 분포")
+        self.setWindowTitle("디버깅: 행렬 해석 기반 최종 전단류(q_final) 분포")
         self.resize(1200, 900)
         layout = QVBoxLayout(self)
         lbl = QLabel("<b>[시각화 가이드]</b><br>"
-                     "컬러 라인: 기하 방향 기준 |q₀| 분포 (jet colormap)<br>"
-                     "<font color='red'><b>컬러 점선(--) 및 '||' 마크: 가상 슬릿(Slit) / 가상 뱅크 (S=0 시작점)</b></font><br>"
-                     "검은색 화살표(▷): Water-flow 기반 S 누적 방향 (합류 노드에서 자동 합산)<br>"
-                     "별(★): 최대 |q₀| 지점")
+                     "컬러 라인: 엣지별 평균 |q_final| 크기 (jet colormap)<br>"
+                     "검은색 화살표(▷): 전단류 흐름 방향 (q_final 부호 기반)<br>"
+                     "별(★): 최대 |q_final| 지점")
         layout.addWidget(lbl)
         
         self.fig = Figure()
@@ -66,69 +65,42 @@ class ShearFlowPathDialog(QDialog):
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
         
-        # 전체 q0 값 중 최대값을 찾아 정규화 범위를 결정 (시각화용)
-        all_q0 = [abs(v) for e in graph_edges for v in e.get('q0_geom', [0])]
-        max_q0_global = max(all_q0) if all_q0 else 1.0
-        norm = mcolors.Normalize(vmin=0, vmax=max_q0_global)
+        all_qf = [abs(e.get('q_final', 0.0)) for e in graph_edges]
+        max_qf_global = max(all_qf) if all_qf and max(all_qf) > 0 else 1.0
+        norm = mcolors.Normalize(vmin=0, vmax=max_qf_global)
         cmap = matplotlib.colormaps.get_cmap('jet')
         
-        max_q0_val = -1.0
-        max_q0_pt = None
+        max_qf_val = -1.0
+        max_qf_pt = None
         
-        # 모든 엣지 렌더링
         for e in graph_edges:
-            pts = np.array(e['sample_pts'])
-            q0_geom = np.abs(e.get('q0_geom', np.zeros(len(pts))))
+            pts = np.array(e.get('sample_pts', [e['line'].coords[0], e['line'].coords[-1]]))
+            qf_val = e.get('q_final', 0.0)
+            abs_qf = abs(qf_val)
+            color = cmap(norm(abs_qf))
             
-            # 컬러맵 기반 엣지 그리기
-            for i in range(len(pts)-1):
-                color = cmap(norm((q0_geom[i] + q0_geom[i+1])/2))
-                if e['is_slit']:
-                    ax.plot([pts[i,0], pts[i+1,0]], [pts[i,1], pts[i+1,1]], color=color, linestyle='--', linewidth=2.5, zorder=3)
-                else:
-                    ax.plot([pts[i,0], pts[i+1,0]], [pts[i,1], pts[i+1,1]], color=color, linewidth=2.5, zorder=2)
+            ax.plot(pts[:,0], pts[:,1], color=color, linewidth=2.5, zorder=2)
             
-            # 최대 |q0| 추적
-            local_max_idx = np.argmax(q0_geom)
-            if q0_geom[local_max_idx] > max_q0_val:
-                max_q0_val = q0_geom[local_max_idx]
-                max_q0_pt = pts[local_max_idx]
+            if abs_qf > max_qf_val:
+                max_qf_val = abs_qf
+                mid_idx = len(pts) // 2
+                max_qf_pt = pts[mid_idx]
                 
-            if e['is_slit']:
-                # 슬릿은 reverse 방향이므로 end_node 위치가 S=0 인 가상 뱅크임
-                geom = e['line']
-                L = geom.length
-                dist = max(0, L - min(50.0, L * 0.05)) # 끝점 부근에 표시
-                slit_pt = geom.interpolate(dist)
-                
-                p_before = geom.interpolate(max(0, dist - 5.0))
-                p_after = geom.interpolate(min(L, dist + 5.0))
-                angle = np.degrees(np.arctan2(p_after.y - p_before.y, p_after.x - p_before.x))
-                
-                ax.text(slit_pt.x, slit_pt.y, '||', color='red', fontsize=14, fontweight='bold',
-                        ha='center', va='center', rotation=angle, zorder=5)
-            
-            # Water-flow 경로 화살표 표시
-            if len(pts) >= 2:
-                mid_idx = (len(pts) - 1) // 2
-                if e.get('bfs_direction') == 'reverse':
-                    p1, p2 = pts[mid_idx+1], pts[mid_idx]
-                else:
+            if len(pts) >= 2 and abs_qf > 1e-6:
+                mid_idx = len(pts) // 2
+                if qf_val > 0:
                     p1, p2 = pts[mid_idx], pts[mid_idx+1]
+                else:
+                    p1, p2 = pts[mid_idx+1], pts[mid_idx]
                 
                 arrow = patches.FancyArrowPatch(
                     (p1[0], p1[1]), (p2[0], p2[1]),
                     mutation_scale=15, color='black', arrowstyle='-|>', zorder=4
                 )
                 ax.add_patch(arrow)
-        
-        # 교차점 (모든 엄격한 노드) 작게 표시
-        for nid, node in graph_nodes.items():
-            rx, ry = node['coord']
-            ax.plot(rx, ry, 'o', markerfacecolor='gray', markeredgecolor='white', markersize=6, zorder=1)
-            
-        if max_q0_pt is not None:
-            ax.plot(max_q0_pt[0], max_q0_pt[1], 'k*', markersize=15, label=f"Max |q₀|: {max_q0_val:.2f} N/mm", zorder=7)
+                
+        if max_qf_pt is not None:
+            ax.plot(max_qf_pt[0], max_qf_pt[1], 'k*', markersize=15, label=f"Max |q_final|: {max_qf_val:.2f} N/mm", zorder=7)
             
         ax.legend(loc='upper right')
         canvas.draw()
@@ -170,7 +142,7 @@ class UltimateShipAnalyzer(QMainWindow):
         self.is_calculated = False
         self.mesh_cells = []
         self.centerlines = []
-        self.shear_flow_centerlines = []
+        self.base_shear_centerlines = [] # 6001~9001 추가 전 단면 보관용
         self.cell_points = []
         self.max_shell_q_idx = -1
         self.max_shell_thk = 0.0
@@ -519,6 +491,204 @@ class UltimateShipAnalyzer(QMainWindow):
         except Exception as e:
             self.result_box.setText(f"❌ Load Error Detailed:\n{traceback.format_exc()}")
 
+    # =========================================================
+    # Matrix Solver Mixin 통합 영역
+    # =========================================================
+    def assign_adjacent_cells_to_edges(self, n_samples=7, tol=2.0, min_hit_ratio=0.6):
+        for edge in self.graph_edges:
+            line = edge['line']
+            sample_ts = np.linspace(0.1, 0.9, n_samples)
+            hit_counts = defaultdict(int)
+            for t in sample_ts:
+                pt = line.interpolate(t, normalized=True)
+                for cid, poly in enumerate(self.mesh_cells):
+                    try:
+                        if poly.exterior.distance(pt) < tol:
+                            hit_counts[cid] += 1
+                    except Exception:
+                        pass
+            adjacent_cell_ids = []
+            for cid, cnt in hit_counts.items():
+                if cnt / max(1, n_samples) >= min_hit_ratio:
+                    adjacent_cell_ids.append(cid)
+            adjacent_cell_ids = sorted(adjacent_cell_ids)
+            edge['adjacent_cell_ids'] = adjacent_cell_ids
+            edge['cell_count'] = len(adjacent_cell_ids)
+
+    def _sample_edge_direction_vector(self, edge):
+        coords = list(edge['line'].coords)
+        if len(coords) < 2: return np.array([0.0, 0.0])
+        p0 = np.array(coords[0][:2], dtype=float)
+        p1 = np.array(coords[-1][:2], dtype=float)
+        v = p1 - p0
+        norm = np.linalg.norm(v)
+        return v / norm if norm > 1e-12 else np.array([0.0, 0.0])
+
+    def _sample_cell_boundary_direction_near_edge(self, cell_poly, edge, n_samples=5):
+        boundary = cell_poly.exterior
+        ts = np.linspace(0.2, 0.8, n_samples)
+        tangent_vectors = []
+        for t in ts:
+            pt = edge['line'].interpolate(t, normalized=True)
+            s = boundary.project(pt)
+            ds = max(boundary.length * 1e-4, 1e-3)
+            s0 = max(0.0, s - ds)
+            s1 = min(boundary.length, s + ds)
+            p0 = boundary.interpolate(s0)
+            p1 = boundary.interpolate(s1)
+            v = np.array([p1.x - p0.x, p1.y - p0.y], dtype=float)
+            norm = np.linalg.norm(v)
+            if norm > 1e-12: tangent_vectors.append(v / norm)
+        if not tangent_vectors: return np.array([0.0, 0.0])
+        v_avg = np.mean(tangent_vectors, axis=0)
+        norm = np.linalg.norm(v_avg)
+        return v_avg / norm if norm > 1e-12 else np.array([0.0, 0.0])
+
+    def build_cell_edge_incidence_matrix(self):
+        n_cells = len(self.mesh_cells)
+        n_edges = len(self.graph_edges)
+        B = np.zeros((n_cells, n_edges), dtype=float)
+        for eid, edge in enumerate(self.graph_edges):
+            adj_cells = edge.get('adjacent_cell_ids', [])
+            if not adj_cells: continue
+            edge_dir = self._sample_edge_direction_vector(edge)
+            for cid in adj_cells:
+                cell_poly = self.mesh_cells[cid]
+                cell_dir = self._sample_cell_boundary_direction_near_edge(cell_poly, edge)
+                dot_val = np.dot(cell_dir, edge_dir)
+                if dot_val >= 0: B[cid, eid] = 1.0
+                else: B[cid, eid] = -1.0
+        self.B = B
+        return B
+
+    def compute_edge_section_integrals(self, n_samples_per_100=1):
+        for edge in self.graph_edges:
+            L = float(edge['length'])
+            n_samples = max(3, int(L / 100.0) * n_samples_per_100 + 2)
+            sample_s = np.linspace(0.0, L, n_samples)
+            sample_pts = []
+            sample_y = []
+            for s in sample_s:
+                pt = edge['line'].interpolate(s)
+                sample_pts.append((pt.x, pt.y))
+                sample_y.append(pt.y)
+            t = float(edge['thickness'])
+            
+            # (수정점 4 반영) y_bar 계산에 전체 단면(종골재 포함)에서 구한 self.calc_na_bl을 그대로 사용
+            y_bar = np.array(sample_y, dtype=float) - float(self.calc_na_bl)
+            ds = np.diff(sample_s)
+            
+            S_local = np.zeros(n_samples, dtype=float)
+            for k in range(1, n_samples):
+                S_local[k] = S_local[k - 1] + t * (y_bar[k - 1] + y_bar[k]) * 0.5 * ds[k - 1]
+                
+            edge['sample_s'] = sample_s
+            edge['sample_pts'] = sample_pts
+            edge['sample_y'] = sample_y
+            edge['y_bar'] = y_bar
+            edge['S_local'] = S_local
+            edge['S_total'] = float(S_local[-1])
+
+    def compute_determinate_edge_shear_flow(self):
+        V = abs(float(self.raw_shear)) * 1000.0 * 9.80665
+        # (수정점 4 반영) qD 계산에 전체 단면에서 구한 Ixx (self.calc_ixx)를 그대로 사용
+        Ixx = float(self.calc_ixx)
+        
+        n_edges = len(self.graph_edges)
+        qD = np.zeros(n_edges, dtype=float)
+        if abs(Ixx) < 1e-12:
+            self.qD = qD
+            return qD
+            
+        for eid, edge in enumerate(self.graph_edges):
+            S_local = np.asarray(edge.get('S_local', [0.0]), dtype=float)
+            if len(S_local) == 0:
+                qD[eid] = 0.0
+                edge['qD'] = 0.0
+                continue
+            S_rep = float(np.mean(S_local))
+            qD_val = V * S_rep / Ixx
+            qD[eid] = qD_val
+            edge['qD'] = qD_val
+            
+        self.qD = qD
+        return qD
+
+    def compute_edge_weights(self, default_G=1.0):
+        n_edges = len(self.graph_edges)
+        w = np.zeros(n_edges, dtype=float)
+        for eid, edge in enumerate(self.graph_edges):
+            L = float(edge['length'])
+            t = float(edge['thickness'])
+            G = float(edge.get('G', default_G))
+            if abs(G) < 1e-12 or abs(t) < 1e-12: w[eid] = 0.0
+            else: w[eid] = L / (G * t)
+            edge['weight_w'] = w[eid]
+        self.w = w
+        self.W = np.diag(w)
+        return w
+
+    def assemble_cell_compatibility_system(self):
+        if not hasattr(self, 'B') or not hasattr(self, 'W') or not hasattr(self, 'qD'): return
+        M = self.B @ self.W @ self.B.T
+        r = - self.B @ (self.W @ self.qD)
+        self.M = M
+        self.r = r
+        return M, r
+
+    def solve_circulatory_shear_flow(self, regularization=1e-10):
+        if not hasattr(self, 'M') or not hasattr(self, 'r'): return np.array([])
+        M = np.array(self.M, dtype=float)
+        r = np.array(self.r, dtype=float)
+        if M.size == 0:
+            self.qc = np.array([], dtype=float)
+            return self.qc
+        M_reg = M + np.eye(M.shape[0]) * regularization
+        try: qc = np.linalg.solve(M_reg, r)
+        except np.linalg.LinAlgError: qc = np.linalg.lstsq(M_reg, r, rcond=None)[0]
+        self.qc = qc
+        return qc
+
+    def assemble_final_edge_shear_flow(self):
+        if not hasattr(self, 'B') or not hasattr(self, 'qD') or not hasattr(self, 'qc'): return
+        q_final = self.qD + self.B.T @ self.qc
+        self.q_final = q_final
+        for eid, edge in enumerate(self.graph_edges):
+            edge['q_final'] = float(q_final[eid])
+        return q_final
+
+    def check_node_equilibrium(self, flow_key='q_final'):
+        residuals = {}
+        for nid in self.graph_nodes.keys():
+            total = 0.0
+            for edge in self.graph_edges:
+                q = float(edge.get(flow_key, 0.0))
+                if edge['start_node'] == nid: total -= q
+                elif edge['end_node'] == nid: total += q
+            residuals[nid] = total
+        self.node_equilibrium_residuals = residuals
+        return residuals
+
+    def solve_shear_flow_matrix_based(self, default_G=1.0):
+        self.assign_adjacent_cells_to_edges()
+        self.build_cell_edge_incidence_matrix()
+        self.compute_edge_section_integrals()
+        self.compute_determinate_edge_shear_flow()
+        self.compute_edge_weights(default_G=default_G)
+        self.assemble_cell_compatibility_system()
+        self.solve_circulatory_shear_flow()
+        self.assemble_final_edge_shear_flow()
+        self.check_node_equilibrium()
+        return {
+            'B': getattr(self, 'B', np.array([])),
+            'qD': getattr(self, 'qD', np.array([])),
+            'qc': getattr(self, 'qc', np.array([])),
+            'q_final': getattr(self, 'q_final', np.array([])),
+            'M': getattr(self, 'M', np.array([])),
+            'r': getattr(self, 'r', np.array([])),
+            'node_equilibrium_residuals': getattr(self, 'node_equilibrium_residuals', {})
+        }
+
     # =====================================================================
     # 메인 연산
     # =====================================================================
@@ -535,6 +705,7 @@ class UltimateShipAnalyzer(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
+        # 1D 추출 헬퍼 함수들 (기존 유지)
         def filter_short(lines, ml=100.0):
             return [l for l in lines if l.length >= ml]
 
@@ -603,7 +774,6 @@ class UltimateShipAnalyzer(QMainWindow):
             used = {i: [] for i in range(len(ls_sorted))}
             pairs = []
             for i in range(len(ls_sorted)):
-                if i % 50 == 0: QApplication.processEvents()
                 if meta[i] is None: continue
                 mi = meta[i]
                 best_j, best_d, best_ov = -1, float('inf'), None
@@ -709,7 +879,6 @@ class UltimateShipAnalyzer(QMainWindow):
             bounds = [cl['line'].bounds for cl in centerlines]
             
             for i, cl in enumerate(centerlines):
-                if i % 50 == 0: QApplication.processEvents()
                 coords = list(cl['line'].coords)
                 if len(coords) < 2:
                     result.append(cl); continue
@@ -843,7 +1012,6 @@ class UltimateShipAnalyzer(QMainWindow):
             intersection_points = []
             
             for i in range(len(all_line_geoms)):
-                if i % 50 == 0: QApplication.processEvents()
                 b1 = bounds[i]
                 for j in range(i + 1, len(all_line_geoms)):
                     b2 = bounds[j]
@@ -921,22 +1089,16 @@ class UltimateShipAnalyzer(QMainWindow):
                 l1999f.append({'line': affinity.scale(ls, xfact=-1.0, origin=(0, 0)), 'thickness': ta, 'type': '1999'})
 
             progress.setLabelText("Step 2: Pre-filtering...")
-            if progress.wasCanceled(): raise UserWarning("Canceled.")
             f1102 = remove_overlapping(filter_short(c1102, 100.0), dt=1.0)
             f157 = remove_overlapping(filter_short(c157, 100.0), dt=1.0)
 
-            progress.setLabelText("Step 3: Healing -1102...")
-            if progress.wasCanceled(): raise UserWarning("Canceled.")
+            progress.setLabelText("Step 3: Healing...")
             h1102 = self.heal_1102_collinear(f1102, threshold_gap=150)
-
-            progress.setLabelText("Step 3.5: Healing 1999...")
-            if progress.wasCanceled(): raise UserWarning("Canceled.")
             l1999f = self.heal_1999_collinear(l1999f, threshold_gap=500.0)
 
-            progress.setLabelText("Step 4: Splitting 157 at slope changes...")
+            progress.setLabelText("Step 4: Splitting 157...")
             s157 = []
-            for l in f157:
-                s157.extend(split_by_slope(l, at=5.0))
+            for l in f157: s157.extend(split_by_slope(l, at=5.0))
             s157 = [s for s in s157 if s.length >= 30.0]
 
             progress.setLabelText("Step 5: Pair matching...")
@@ -954,11 +1116,9 @@ class UltimateShipAnalyzer(QMainWindow):
             all_cl = cl1999 + cl1102 + cl157
 
             progress.setLabelText("Step 7: Ray-casting (≤100mm)...")
-            if progress.wasCanceled(): raise UserWarning("Canceled.")
             all_cl, ext_pts = raycast_extend(all_cl, max_dist=100.0)
 
             progress.setLabelText("Step 8: Bridging open nodes (≤100mm)...")
-            if progress.wasCanceled(): raise UserWarning("Canceled.")
             all_cl, bc = bridge_open_nodes(all_cl, ext_pts, max_gap=100.0)
 
             progress.setLabelText("Step 9: Filtering redundant nodes...")
@@ -969,28 +1129,36 @@ class UltimateShipAnalyzer(QMainWindow):
                 prev = len(nl)
                 all_cl = nl
 
+            # =============================================================
+            # 수정점 1 반영: 6001~9001 종골재 추가 전의 기본 단면을 따로 저장
+            # =============================================================
             all_cl = split_all_lines_at_intersections(all_cl)
+            self.base_shear_centerlines = list(all_cl) # 전단류 흐름 전용 뼈대
 
             progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
             QApplication.processEvents()
-
-            planarized_network = unary_union([cl['line'] for cl in all_cl])
+            planarized_network = unary_union([cl['line'] for cl in self.base_shear_centerlines])
             try:
                 from shapely import set_precision
                 planarized_network = set_precision(planarized_network, grid_size=0.01)
             except ImportError:
                 pass
-
             raw_loops = list(polygonize(planarized_network))
             self.mesh_cells = [poly for poly in raw_loops if poly.area >= 100.0]
 
-            # 전단류 연산용 메인 선체 단면 (보강재 적용 전)
-            self.shear_flow_centerlines = list(all_cl)
+            # =============================================================
+            # 수정점 3 반영: 엄격하게 폐루프 폴리곤의 꼭짓점만을 cell_point로 할당
+            # =============================================================
+            cell_points_set = set()
+            for poly in self.mesh_cells:
+                for pt in poly.exterior.coords:
+                    cell_points_set.add((round(pt[0], 2), round(pt[1], 2)))
+            self.cell_points = list(cell_points_set)
 
             # =============================================================
-            # 종골재(Stiffener) 추출 및 1D Inertia 연산을 위해 centerlines 생성
+            # Step 11: 종골재(Stiffener) 추출 및 이너시아(Inertia) 연산용 단면 병합
             # =============================================================
-            progress.setLabelText("Step 11: 종골재(Stiffener) 1D 추출 및 공간 인덱싱 병합 중...")
+            progress.setLabelText("Step 11: 종골재 병합 및 전체 1D 인덱싱 중...")
             QApplication.processEvents()
 
             raw_stiffs = c6001 + c7001 + c8001 + c9001
@@ -1006,7 +1174,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
             target_lines = all_cl 
             healed_stiff_cl = []
-            
             target_geoms = [o['line'] for o in target_lines]
             tree = STRtree(target_geoms)
 
@@ -1019,14 +1186,12 @@ class UltimateShipAnalyzer(QMainWindow):
                     vn = np.linalg.norm(v)
                     if vn < 1e-6: continue
                     d = v / vn
-
                     p_point = Point(p)
                     
                     res_open = tree.query(p_point.buffer(1e-3))
                     if len(res_open) > 0 and isinstance(res_open[0], (int, np.integer)):
                         close_1e3 = [target_geoms[i] for i in res_open]
-                    else:
-                        close_1e3 = list(res_open)
+                    else: close_1e3 = list(res_open)
                         
                     is_open = True
                     for cg in close_1e3:
@@ -1038,8 +1203,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         res_10 = tree.query(p_point.buffer(10.0))
                         if len(res_10) > 0 and isinstance(res_10[0], (int, np.integer)):
                             close_10 = [target_geoms[i] for i in res_10]
-                        else:
-                            close_10 = list(res_10)
+                        else: close_10 = list(res_10)
                             
                         close_lines = []
                         for cg in close_10:
@@ -1056,22 +1220,19 @@ class UltimateShipAnalyzer(QMainWindow):
                                     pts = [inter] if inter.geom_type == 'Point' else list(inter.geoms) if inter.geom_type == 'MultiPoint' else []
                                     for pt in pts:
                                         dd = np.linalg.norm(np.array([pt.x, pt.y]) - p)
-                                        if dd < bd:
-                                            bd = dd; bp = (pt.x, pt.y)
+                                        if dd < bd: bd = dd; bp = (pt.x, pt.y)
                             if bp and bd <= 10.0:
                                 if ei == 0: coords[0] = bp
                                 else: coords[-1] = bp
                 healed_stiff_cl.append({'line': LineString(coords), 'thickness': cl['thickness'], 'type': cl['type']})
 
-            all_combined_cl = all_cl + healed_stiff_cl
-            all_combined_cl = split_all_lines_at_intersections(all_combined_cl)
-
-            self.centerlines = all_combined_cl
+            all_combined_cl = self.base_shear_centerlines + healed_stiff_cl
+            self.centerlines = split_all_lines_at_intersections(all_combined_cl)
 
             # =============================================================
-            # 11.5: 1D Line 기반의 이너시아(Inertia) 연산
+            # 수정점 4 반영: 이너시아 및 단면적은 종골재 포함된 전체 단면(self.centerlines) 사용
             # =============================================================
-            progress.setLabelText("Step 11.5: 1D Line 기반 이너시아(Inertia) 연산...")
+            progress.setLabelText("Step 11.5: 1D Line 기반 전체 단면 이너시아(Inertia) 연산...")
             QApplication.processEvents()
             
             a_1d_total = 0.0
@@ -1082,7 +1243,6 @@ class UltimateShipAnalyzer(QMainWindow):
                 coords = list(cl['line'].coords)
                 thk = cl.get('thickness', 10.0)
                 if thk <= 0: thk = 10.0
-                
                 for i in range(len(coords) - 1):
                     x1, y1 = coords[i]
                     x2, y2 = coords[i+1]
@@ -1125,314 +1285,148 @@ class UltimateShipAnalyzer(QMainWindow):
             z_act_top_mm3 = self.calc_ixx / dist_top_1d if dist_top_1d != 0 else 1e-9
             self.act_fb = (abs(self.raw_swbm) * 9.80665 * 1e6) / z_act_top_mm3
 
-
             # =============================================================
-            # [신규] Step 12: 가상 슬릿 배치 및 초기 전단류(q0) 계산
-            # (목표 1~4 완벽 반영: 공유격벽 보존, Water-flow 방식 S 누적)
+            # Step 12: 닫힌 구조 그래프 정제 및 행렬 전단류 연산
             # =============================================================
-            progress.setLabelText("Step 12: 가상 슬릿 배치 및 전단류(q0) 산출 중...")
+            progress.setLabelText("Step 12: 전단류 흐름 경로 탐색 및 가지치기...")
             QApplication.processEvents()
-            
-            # --- 1. 맹장(자유단, degree=1) 반복 가지치기 ---
+
+            node_map = {}
+            node_coords = []
+            def get_node_id(pt):
+                k = (round(pt[0], 2), round(pt[1], 2))
+                if k not in node_map:
+                    node_map[k] = len(node_coords)
+                    node_coords.append(pt)
+                return node_map[k]
+
+            # 수정점 1 반영: base_shear_centerlines 사용
             raw_edges = []
-            for i, cl in enumerate(self.shear_flow_centerlines):
-                c = list(cl['line'].coords)
-                if len(c) < 2: continue
-                p1 = (round(c[0][0], 2), round(c[0][1], 2))
-                p2 = (round(c[-1][0], 2), round(c[-1][1], 2))
-                if p1 == p2: continue
-                raw_edges.append({'p1': p1, 'p2': p2, 'line': cl['line'], 'thk': cl.get('thickness', 10.0)})
-                
-            changed = True
-            while changed:
-                changed = False
-                node_deg = defaultdict(int)
-                for e in raw_edges:
-                    node_deg[e['p1']] += 1
-                    node_deg[e['p2']] += 1
-                
-                survivors = []
-                for e in raw_edges:
-                    if node_deg[e['p1']] <= 1 or node_deg[e['p2']] <= 1:
-                        changed = True
-                    else:
-                        survivors.append(e)
-                
-                if not survivors and raw_edges:
-                    survivors = raw_edges
-                    break
-                raw_edges = survivors
-                
-            # --- 2. 엄격한 진짜 꼭짓점 선별 ---
-            deg = defaultdict(int)
-            adj = defaultdict(list)
-            for i, e in enumerate(raw_edges):
-                deg[e['p1']] += 1
-                deg[e['p2']] += 1
-                adj[e['p1']].append(i)
-                adj[e['p2']].append(i)
-                
-            strict_vertices = set()
-            for pt, d in deg.items():
-                if d >= 3:
-                    strict_vertices.add(pt)
-                elif d == 2:
-                    e1_idx, e2_idx = adj[pt]
-                    e1, e2 = raw_edges[e1_idx], raw_edges[e2_idx]
-                    
-                    def get_vec_away(edge, point):
-                        coords = list(edge['line'].coords)
-                        p_start = (round(coords[0][0], 2), round(coords[0][1], 2))
-                        if p_start == point:
-                            v = np.array(coords[1]) - np.array(coords[0])
-                        else:
-                            v = np.array(coords[-2]) - np.array(coords[-1])
-                        norm = np.linalg.norm(v)
-                        return (v / norm) if norm > 1e-6 else np.array([0.0, 0.0])
+            for eid, cl in enumerate(self.base_shear_centerlines):
+                line = cl['line']
+                sn = get_node_id(line.coords[0])
+                en = get_node_id(line.coords[-1])
+                raw_edges.append({
+                    'id': eid, 'start_node': sn, 'end_node': en,
+                    'line': line, 'length': line.length,
+                    'thickness': cl.get('thickness', 10.0), 'type': cl.get('type', '')
+                })
 
-                    v1 = get_vec_away(e1, pt)
-                    v2 = get_vec_away(e2, pt)
-                    cos_th = np.clip(np.dot(v1, v2), -1.0, 1.0)
-                    angle = np.degrees(np.arccos(cos_th))
-                    
-                    if abs(angle - 180.0) > 2.0:
-                        strict_vertices.add(pt)
-                elif d == 1:
-                    strict_vertices.add(pt)
-                    
-            if not strict_vertices and raw_edges:
-                strict_vertices.add(raw_edges[0]['p1'])
+            # =============================================================
+            # 수정점 2 반영: degree=1 인 맹장(가지) 선분들 반복적으로 제거 (뼈대만 남김)
+            # =============================================================
+            node_adj = defaultdict(list)
+            for e in raw_edges:
+                node_adj[e['start_node']].append(e)
+                node_adj[e['end_node']].append(e)
+
+            pruned_edge_ids = set()
+            while True:
+                deg1_nodes = [nid for nid, edges in node_adj.items() if len(edges) == 1]
+                if not deg1_nodes: break
                 
-            self.cell_points = list(strict_vertices)
-            self.graph_nodes = {nid: {'coord': pt} for nid, pt in enumerate(self.cell_points)}
-            pt_to_nid = {pt: nid for nid, pt in enumerate(self.cell_points)}
-            
-            # --- 3. Macro Edges 생성 (일직선 분할 노드 병합) 및 Cost 할당 (목표 1) ---
-            macro_edges = []
-            visited_raw_edges = set()
-            current_eid = 0
-            node_edges = defaultdict(list)
-            
-            for start_pt in self.cell_points:
-                for edge_idx in adj.get(start_pt, []):
-                    if edge_idx in visited_raw_edges:
-                        continue
-                        
-                    current_pt = start_pt
-                    current_edge_idx = edge_idx
-                    path_coords = []
-                    thk = raw_edges[current_edge_idx]['thk']
+                removed_any = False
+                for nid in deg1_nodes:
+                    if not node_adj[nid]: continue
+                    edge = node_adj[nid][0]
+                    pruned_edge_ids.add(edge['id'])
                     
-                    while True:
-                        visited_raw_edges.add(current_edge_idx)
-                        edge = raw_edges[current_edge_idx]
+                    # 인접 정보에서도 제거
+                    if edge in node_adj[edge['start_node']]: node_adj[edge['start_node']].remove(edge)
+                    if edge in node_adj[edge['end_node']]: node_adj[edge['end_node']].remove(edge)
+                    removed_any = True
+                    
+                if not removed_any: break
+
+            # 가지치기가 완료된 최종 폐루프 중심 뼈대 엣지들
+            surviving_edges = [e for e in raw_edges if e['id'] not in pruned_edge_ids]
+
+            # 뼈대 엣지들을 행렬 계산에 맞게 재정의 및 매크로 엣지화
+            raw_adj = defaultdict(list)
+            for e in surviving_edges:
+                raw_adj[e['start_node']].append(e)
+                raw_adj[e['end_node']].append(e)
+
+            merged_edges = []
+            visited_raw = set()
+            macro_id = 0
+
+            # 분기점(교차로)에서부터 직렬 연결된 엣지들을 병합
+            for node_idx in range(len(node_coords)):
+                if len(raw_adj[node_idx]) != 2: # 교차로(분기점)
+                    for start_edge in raw_adj[node_idx]:
+                        if start_edge['id'] in visited_raw: continue
+                        curr_node = node_idx
+                        curr_edge = start_edge
+                        macro_lines = []
                         
-                        c = list(edge['line'].coords)
-                        e_p1, e_p2 = edge['p1'], edge['p2']
-                        
-                        if e_p2 == current_pt:
-                            c = c[::-1]
-                            nxt_pt = e_p1
-                        else:
-                            nxt_pt = e_p2
+                        while True:
+                            visited_raw.add(curr_edge['id'])
+                            coords = list(curr_edge['line'].coords)
+                            if get_node_id(coords[-1]) == curr_node:
+                                coords = coords[::-1]
                             
-                        if not path_coords:
-                            path_coords.extend(c)
-                        else:
-                            path_coords.extend(c[1:])
+                            if not macro_lines: macro_lines.extend(coords)
+                            else: macro_lines.extend(coords[1:])
+
+                            nxt_node = get_node_id(coords[-1])
                             
-                        current_pt = nxt_pt
-                        
-                        if current_pt in strict_vertices:
-                            break
-                            
-                        next_edges = [ei for ei in adj[current_pt] if ei not in visited_raw_edges]
-                        if not next_edges:
-                            break
-                        current_edge_idx = next_edges[0]
-                        
-                    macro_line = LineString(path_coords)
-                    mid_pt = macro_line.interpolate(0.5, normalized=True)
-                    cell_count = sum(1 for poly in self.mesh_cells if poly.exterior.distance(mid_pt) < 2.0)
-                    
-                    # [목표 1] 공유 격벽은 절대 Cut 금지 (-1000), 외곽선만 Cut 후보 (100)
-                    if cell_count >= 2: 
-                        cost = -1000
-                    elif cell_count == 1: 
-                        # 대칭축(x=0)에 가까운 외곽선을 우선적으로 Cut
-                        cost = 100 - (10.0 / (abs(mid_pt.x) + 1.0))
-                    else: 
-                        cost = -2000
-                    
-                    sn = pt_to_nid[start_pt]
-                    en = pt_to_nid.get(current_pt, sn)
-                    
-                    if sn != en:
-                        edge_dict = {
-                            'id': current_eid, 'start_node': sn, 'end_node': en,
-                            'line': macro_line, 'length': macro_line.length,
-                            'thickness': thk, 'cell_count': cell_count, 'cost': cost
-                        }
-                        macro_edges.append(edge_dict)
-                        node_edges[sn].append(current_eid)
-                        node_edges[en].append(current_eid)
-                        current_eid += 1
-                        
-            self.graph_edges = macro_edges
-            
-            # --- 단계 C: Kruskal 최소 비용 스패닝 트리 (1셀 1슬릿 확정) ---
-            parent = {i: i for i in range(len(self.cell_points))}
-            def find(i):
-                if parent[i] == i: return i
-                parent[i] = find(parent[i])
-                return parent[i]
-            def union(i, j):
-                root_i = find(i)
-                root_j = find(j)
-                if root_i != root_j:
-                    parent[root_i] = root_j
-                    return True
-                return False
-                
-            sorted_edge_indices = sorted(range(len(self.graph_edges)), key=lambda i: self.graph_edges[i]['cost'])
-            
-            self.slit_edge_ids = set()
-            tree_edge_ids = set()
-            
-            for eid in sorted_edge_indices:
-                e = self.graph_edges[eid]
-                if union(e['start_node'], e['end_node']):
-                    tree_edge_ids.add(eid)
-                else:
-                    self.slit_edge_ids.add(eid)
-                        
-            for e in self.graph_edges:
-                e['is_slit'] = e['id'] in self.slit_edge_ids
-
-            # --- 단계 D: 위상 정렬 (Water-Flow) 기반 S 누적 (목표 2, 3) ---
-            # 1. 각 구간별 S 증가분(increments) 사전 계산
-            for edge in self.graph_edges:
-                L = edge['length']
-                n_samples = max(2, int(L / 100.0) + 1)
-                edge['sample_s'] = np.linspace(0, L, n_samples)
-                edge['sample_pts'] = []
-                edge['sample_y'] = []
-                
-                for s in edge['sample_s']:
-                    pt = edge['line'].interpolate(s)
-                    edge['sample_pts'].append((pt.x, pt.y))
-                    edge['sample_y'].append(pt.y)
-                    
-                t = edge['thickness']
-                y_bar = np.array(edge['sample_y']) - self.calc_na_bl
-                ds = np.diff(edge['sample_s'])
-                
-                # 구간별 S 증가량
-                increments = np.zeros(n_samples)
-                for k in range(1, n_samples):
-                    increments[k] = t * (y_bar[k-1] + y_bar[k]) / 2.0 * ds[k-1]
-                
-                edge['increments'] = increments
-                edge['S_total'] = np.sum(increments)
-                
-            # 2. Water-Flow를 위한 위상 정렬 준비
-            unresolved_degree = defaultdict(int)
-            for eid in tree_edge_ids:
-                e = self.graph_edges[eid]
-                unresolved_degree[e['start_node']] += 1
-                unresolved_degree[e['end_node']] += 1
-
-            S_sum_at_node = defaultdict(float)
-
-            # 3. 슬릿 엣지를 가상 뱅크(Virtual Bank, S=0 시작점)로 취급하여 흐름 주입
-            for eid in self.slit_edge_ids:
-                edge = self.graph_edges[eid]
-                edge['bfs_direction'] = 'reverse' # 끝점에서 시작점으로 강제 흐름
-                
-                n_samples = len(edge['sample_s'])
-                S_acc = np.zeros(n_samples)
-                rev_incs = edge['increments'][::-1]
-                current_S = 0.0 # Virtual Bank 시작
-                
-                for k in range(1, n_samples):
-                    current_S += rev_incs[k-1]
-                    S_acc[k] = current_S
-                    
-                edge['S_accumulated'] = S_acc
-                
-                # 끝점에서 출발해 도착한 시작점 노드에 누적된 S값 주입 (합류)
-                S_sum_at_node[edge['start_node']] += edge['S_total']
-
-            # 4. Leaf 노드부터 차례대로 Water-flow 누적 (위상 정렬 Queue)
-            queue = deque([nid for nid in self.graph_nodes if unresolved_degree[nid] <= 1])
-            
-            while queue:
-                u = queue.popleft()
-                if unresolved_degree[u] == 0:
-                    continue # 최종 합류 지점 (Ultimate Sink)
-                    
-                # 현재 노드에서 뻗어나갈 유일한 미해결 엣지 찾기
-                edge_idx = -1
-                for eid in node_edges[u]:
-                    if eid in tree_edge_ids:
-                        edge_idx = eid
-                        break
-                        
-                if edge_idx == -1: continue
-                edge = self.graph_edges[edge_idx]
-                tree_edge_ids.remove(edge_idx)
-                
-                v = edge['start_node'] if edge['end_node'] == u else edge['end_node']
-                
-                # [목표 3] 이 지점까지 모인 모든 S_sum_at_node[u]를 시작값으로 사용
-                start_S = S_sum_at_node[u]
-                n_samples = len(edge['sample_s'])
-                S_acc = np.zeros(n_samples)
-                current_S = start_S
-                
-                if edge['start_node'] == u:
-                    edge['bfs_direction'] = 'forward'
-                    incs = edge['increments']
-                    S_acc[0] = start_S
-                    for k in range(1, n_samples):
-                        current_S += incs[k]
-                        S_acc[k] = current_S
-                else:
-                    edge['bfs_direction'] = 'reverse'
-                    rev_incs = edge['increments'][::-1]
-                    S_acc[0] = start_S
-                    for k in range(1, n_samples):
-                        current_S += rev_incs[k-1]
-                        S_acc[k] = current_S
-                        
-                edge['S_accumulated'] = S_acc
-                
-                # 다음 노드 v로 흐름을 전달 (합류)
-                S_sum_at_node[v] += current_S
-                
-                unresolved_degree[u] -= 1
-                unresolved_degree[v] -= 1
-                
-                if unresolved_degree[v] == 1:
-                    queue.append(v)
+                            if len(raw_adj[nxt_node]) == 2:
+                                e1, e2 = raw_adj[nxt_node]
+                                nxt_edge = e2 if e1['id'] == curr_edge['id'] else e1
                                 
-            # 5. 최종 정정 전단류 q0 산출
-            V = abs(self.raw_shear) * 1000 * 9.80665
-            Ixx = self.calc_ixx
-            
-            for edge in self.graph_edges:
-                if 'S_accumulated' in edge:
-                    if Ixx > 1e-6:
-                        q0 = -V * edge['S_accumulated'] / Ixx
-                    else:
-                        q0 = np.zeros(len(edge['sample_s']))
+                                if (nxt_edge['id'] not in visited_raw and
+                                    abs(nxt_edge['thickness'] - curr_edge['thickness']) < 0.1):
+                                    curr_node = nxt_node
+                                    curr_edge = nxt_edge
+                                    continue
+                            break
                         
-                    edge['q0'] = q0
-                    # 기하학 방향과 매핑
-                    if edge.get('bfs_direction') == 'reverse':
-                        edge['q0_geom'] = q0[::-1]
-                    else:
-                        edge['q0_geom'] = q0
+                        merged_edges.append({
+                            'id': macro_id, 'start_node': node_idx, 'end_node': nxt_node,
+                            'line': LineString(macro_lines), 'length': LineString(macro_lines).length,
+                            'thickness': start_edge['thickness'], 'type': start_edge['type']
+                        })
+                        macro_id += 1
+
+            # 분기점이 아예 없는 완전한 원형 단일 루프 예외 처리
+            for e in surviving_edges:
+                if e['id'] not in visited_raw:
+                    curr_node = e['start_node']
+                    curr_edge = e
+                    macro_lines = []
+                    while True:
+                        visited_raw.add(curr_edge['id'])
+                        coords = list(curr_edge['line'].coords)
+                        if get_node_id(coords[-1]) == curr_node:
+                            coords = coords[::-1]
+                        if not macro_lines: macro_lines.extend(coords)
+                        else: macro_lines.extend(coords[1:])
+
+                        nxt_node = get_node_id(coords[-1])
+                        e1, e2 = raw_adj[nxt_node]
+                        nxt_edge = e2 if e1['id'] == curr_edge['id'] else e1
+                        if nxt_edge['id'] not in visited_raw:
+                            curr_node = nxt_node
+                            curr_edge = nxt_edge
+                            continue
+                        break
+                    merged_edges.append({
+                        'id': macro_id, 'start_node': curr_node, 'end_node': nxt_node,
+                        'line': LineString(macro_lines), 'length': LineString(macro_lines).length,
+                        'thickness': e['thickness'], 'type': e['type']
+                    })
+                    macro_id += 1
+
+            self.graph_edges = merged_edges
+            self.graph_nodes = {i: {'coord': pt} for i, pt in enumerate(node_coords)}
+
+            # Matrix Solver 파이프라인 일괄 실행
+            res_matrix = self.solve_shear_flow_matrix_based(default_G=1.0)
+            
+            q_max_val = max([abs(e.get('q_final', 0.0)) for e in self.graph_edges]) if self.graph_edges else 0.0
+            self.calc_max_q_val = q_max_val
+            self.q_per_v = q_max_val
 
             # =============================================================
             # 출력창(결과) 리포트 업데이트
@@ -1450,13 +1444,18 @@ class UltimateShipAnalyzer(QMainWindow):
             res += f"Zact_top         : {self.calc_z_top:,.4f} m^3\n\n"
 
             res += f"--- 1D Extraction & Graph Results ---\n"
-            res += f"Centerlines      : {len(self.centerlines)} (Incl. Stiffeners)\n"
-            res += f"Shear Edges      : {len(self.shear_flow_centerlines)} (No Stiffeners)\n"
-            res += f"Detected Cells   : {len(self.mesh_cells)} (Closed Loops)\n"
-            res += f"Strict Vertices  : {len(self.graph_nodes)} (Only true corners/junctions)\n"
-            res += f"Macro Graph Edges: {len(self.graph_edges)} (Merged Paths)\n"
-            res += f"Tree Edges       : {len([e for e in self.graph_edges if not e['is_slit']])}\n"
-            res += f"Slit Edges       : {len(self.slit_edge_ids)} (1 Cut per Cell)\n"
+            res += f"Full Section Lines : {len(self.centerlines)}\n"
+            res += f"Base Shear Lines   : {len(self.base_shear_centerlines)} (Before Stiffeners)\n"
+            res += f"Detected Cells     : {len(self.mesh_cells)} (Closed Loops)\n"
+            res += f"Shear Flow Edges   : {len(self.graph_edges)} (Degree=1 Pruned)\n"
+            
+            if hasattr(self, 'B') and self.B.size > 0:
+                res += f"Incidence Matrix   : {self.B.shape[0]} x {self.B.shape[1]} (Cells x Edges)\n"
+            else:
+                res += f"Incidence Matrix   : Not calculated (No closed loops found)\n"
+                
+            res += f"Circulatory qc     : {len(res_matrix.get('qc', []))} items\n"
+            res += f"Max q_final        : {q_max_val:.2f} N/mm\n"
 
             self.base_report = res
             self.result_box.setText(self.base_report)
@@ -1468,8 +1467,9 @@ class UltimateShipAnalyzer(QMainWindow):
             QApplication.processEvents()
             self.refresh_ui()
 
+            # 계산이 끝나면 q_final 시각화 팝업 띄우기
             if self.graph_edges:
-                self.dialog_shear_flow = ShearFlowPathDialog(self.graph_edges, self.graph_nodes, self.root_node, self)
+                self.dialog_shear_flow = ShearFlowPathDialog(self.graph_edges, self.graph_nodes, self)
                 self.dialog_shear_flow.show()
                 self.debug_dialogs.append(self.dialog_shear_flow)
 
@@ -1500,7 +1500,12 @@ class UltimateShipAnalyzer(QMainWindow):
         final_res = self.base_report + "\n--- Strength Check & Utilization ---\n"
         final_res += f"Material         : {self.combo_material_type.currentText()}\n\n"
         final_res += f"Bending Stress   : {self.act_fb:.2f} / {self.allow_fb:.2f} N/mm2 ({self.act_fb / self.allow_fb * 100:.1f}%) [{'PASS' if self.act_fb <= self.allow_fb else 'FAIL'}]\n"
-        final_res += f"Shear Stress     : (Pending - 순환 전단류 q_c 산출 대기중)\n"
+        
+        t_min = min([float(t.text()) for t in self.shell_thickness_inputs]) if self.shell_thickness_inputs else 10.0
+        self.act_fs = (self.calc_max_q_val) / t_min if t_min > 0 else 0.0
+        
+        final_res += f"Max Shear Stress : {self.act_fs:.2f} / {self.allow_fs:.2f} N/mm2 ({self.act_fs / self.allow_fs * 100:.1f}%) [{'PASS' if self.act_fs <= self.allow_fs else 'FAIL'}]\n"
+        
         self.result_box.setText(final_res)
         self.btn_save_frame.setEnabled(True)
 
@@ -1720,7 +1725,6 @@ class UltimateShipAnalyzer(QMainWindow):
                         ws.cell(r, c).border = b_all
                         ws.cell(r, c).alignment = a_c
                         ws.cell(r, c).font = f_11n
-
                 ws.merge_cells(start_row=row_idx + 1, start_column=1, end_row=row_idx + 3, end_column=1)
                 ws.cell(row_idx + 1, 1).border = b_all
                 ws.cell(row_idx + 2, 1).border = b_all
@@ -1766,7 +1770,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
             wb.save(path)
             QMessageBox.information(self, "Success", "Export Done!")
-            
         except PermissionError:
             QMessageBox.critical(self, "Error (Errno 13)",
                                  "The file is currently open in Excel.\nPlease close it and try again.")
@@ -1820,7 +1823,7 @@ class UltimateShipAnalyzer(QMainWindow):
             if hasattr(self, 'cell_points') and self.cell_points:
                 ax2.plot([p[0] for p in self.cell_points], [p[1] for p in self.cell_points], 'ro', markersize=4,
                          markeredgecolor='white', markeredgewidth=0.5,
-                         label=f'Points ({len(self.cell_points)})', zorder=11)
+                         label=f'Cell Points ({len(self.cell_points)})', zorder=11)
                 
             h, l = ax2.get_legend_handles_labels()
             if h: ax2.legend(loc="upper right", fontsize=8)
@@ -1853,6 +1856,7 @@ class UltimateShipAnalyzer(QMainWindow):
             ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{-x:g}"))
         self.can1.draw()
         self.can2.draw()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
