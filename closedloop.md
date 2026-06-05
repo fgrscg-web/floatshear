@@ -460,7 +460,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
             for j, ep2 in enumerate(endpoints):
                 if i == j or j in used_pts: continue
-                # (삭제됨) if ep1['idx'] == ep2['idx']: continue -> 자신의 꼬리 물기 허용!
 
                 dist = np.linalg.norm(ep1['pt'] - ep2['pt'])
                 if dist <= best_dist:
@@ -1472,12 +1471,44 @@ class UltimateShipAnalyzer(QMainWindow):
                 ax2.axvline(x=x_cut, color='gray', linestyle='--', linewidth=1, zorder=20, alpha=0.7)
 
                 # ==========================================
-                # ✨ 8. [핵심] 완벽한 위상 데이터베이스(Topology DB) 구축
-                # 각 루프의 선분, 두께, 노드, 공유 격벽 여부를 모두 저장합니다.
+                # ✨ 8. 완벽한 위상 DB 구축 및 노드 정밀 탐색 (Centerline 누락 방지)
                 # ==========================================
                 self.loop_data = {}
+                global_node_map = {}
 
-                # [1차 순회] 각 루프에 속하는 선분들과 노드(Vertices) 추출
+                # 1. 오차 허용(1.0mm) 전역 노드 맵핑
+                def get_node_key(pt):
+                    for k in global_node_map.keys():
+                        if np.hypot(k[0] - pt[0], k[1] - pt[1]) < 1.0: return k
+                    global_node_map[pt] = []
+                    return pt
+
+                for info in cut_lines_info:
+                    if info['type'] == 'centerline_wall': continue
+                    geom = info['line_geometry']
+                    c = list(geom.coords)
+                    if len(c) < 2: continue
+                    n1, n2 = get_node_key((c[0][0], c[0][1])), get_node_key((c[-1][0], c[-1][1]))
+                    info['n1'], info['n2'] = n1, n2
+                    info['flow_vec'] = None
+                    info['is_split'] = False
+                    global_node_map[n1].append(info)
+                    global_node_map[n2].append(info)
+
+                filter_limit = x_cut + 1.0
+
+                # 2. DEGREE=1(Open Node) 최우선 탐색 및 반대 방향 흐름 강제 할당
+                open_nodes = [pt for pt, lines in global_node_map.items() if len(lines) == 1 and pt[0] <= filter_limit]
+                for pt in open_nodes:
+                    info = global_node_map[pt][0]
+                    c = list(info['line_geometry'].coords)
+                    v_seg = np.array(c[-1]) - np.array(c[0])
+                    flow = v_seg if np.hypot(c[0][0] - pt[0], c[0][1] - pt[1]) < 1.0 else -v_seg
+                    norm = np.linalg.norm(flow)
+                    if norm > 1e-6:
+                        info['flow_vec'] = (flow / norm)[0], (flow / norm)[1]
+
+                # 3. 루프 데이터베이스 구축 (가상의 컷팅선 무시)
                 for idx, poly in enumerate(filtered_loops):
                     loop_name = f"L{idx + 1}"
                     boundary = poly.boundary
@@ -1485,98 +1516,105 @@ class UltimateShipAnalyzer(QMainWindow):
                     loop_nodes = set()
 
                     for info in cut_lines_info:
-                        geom = info['line_geometry']
-                        # 현재 선분이 루프 테두리에 속해 있는지 검사
-                        if boundary.intersection(geom).length > 1.0:
-                            coords = list(geom.coords)
-                            node_start = (round(coords[0][0], 2), round(coords[0][1], 2))
-                            node_end = (round(coords[-1][0], 2), round(coords[-1][1], 2))
+                        if info['type'] == 'centerline_wall': continue
 
+                        geom = info['line_geometry']
+                        if boundary.intersection(geom).length > 1.0:
                             seg_data = {
-                                'line_geometry': geom,
-                                'thickness': info['thickness'],
-                                'type': info['type'],
-                                'length': geom.length,
-                                'nodes': (node_start, node_end),
-                                'is_shared': False,  # 초기값
-                                'shared_with': []  # 초기값
+                                'line_geometry': geom, 'thickness': info['thickness'], 'type': info['type'],
+                                'length': geom.length, 'nodes': (info['n1'], info['n2']),
+                                'is_shared': False, 'shared_with': [], 'flow_vec': info.get('flow_vec'),
+                                'info_ref': info
                             }
                             segs_in_loop.append(seg_data)
-                            loop_nodes.add(node_start)
-                            loop_nodes.add(node_end)
+                            loop_nodes.update([info['n1'], info['n2']])
 
                     self.loop_data[loop_name] = {
-                        'polygon': poly,
-                        'area': poly.area,
-                        'centroid': (poly.centroid.x, poly.centroid.y),
-                        'segments': segs_in_loop,
-                        'nodes': list(loop_nodes)
+                        'polygon': poly, 'area': poly.area, 'centroid': (poly.centroid.x, poly.centroid.y),
+                        'segments': segs_in_loop, 'nodes': list(loop_nodes)
                     }
-
-                    # 시각화 (기존 텍스트 라벨링)
-                    cx, cy = poly.centroid.x, poly.centroid.y
-                    ax2.text(cx, cy, loop_name, color='black', fontsize=10, fontweight='bold',
+                    ax2.text(poly.centroid.x, poly.centroid.y, loop_name, color='black', fontsize=10, fontweight='bold',
                              ha='center', va='center', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=2),
                              zorder=15)
 
-                # [2차 순회] 이중 루프 검사를 통해 '공유 격벽(Shared Bulkhead)' 완벽 식별
+                # 4. 공유 격벽 판별
                 loop_names = list(self.loop_data.keys())
                 for i in range(len(loop_names)):
                     for j in range(i + 1, len(loop_names)):
-                        name_A = loop_names[i]
-                        name_B = loop_names[j]
-
-                        for segA in self.loop_data[name_A]['segments']:
-                            for segB in self.loop_data[name_B]['segments']:
-                                # 물리적으로 동일한 선분이라면 공유 격벽으로 판정
+                        for segA in self.loop_data[loop_names[i]]['segments']:
+                            for segB in self.loop_data[loop_names[j]]['segments']:
                                 if segA['line_geometry'].equals_exact(segB['line_geometry'], 1e-3):
-                                    segA['is_shared'] = True
-                                    segA['shared_with'].append(name_B)
-
-                                    segB['is_shared'] = True
-                                    segB['shared_with'].append(name_A)
+                                    segA['is_shared'], segB['is_shared'] = True, True
+                                    segA['shared_with'].append(loop_names[j])
+                                    segB['shared_with'].append(loop_names[i])
 
                 # ==========================================
-                # ✨ 9. 전 구간 체인(Chain) 전단류 흐름 분배 및 가상 슬릿 네트워크
+                # ✨ 9. 슬릿 분배 및 위상 흐름 라우팅
                 # ==========================================
                 from shapely.geometry import Point
                 from shapely.ops import linemerge
-                import numpy as np
 
                 AREA_THRESHOLD = 50 * 1000 * 1000
                 slit_map = {}
                 virtual_slits = set()
                 processed_pairs = set()
 
-                # ---------------------------------------------------------
-                # (1) 모든 공유 격벽 병합 및 엄선된 단일 가상 슬릿(정중앙) 배치
-                # ---------------------------------------------------------
+                # 1. 1차 슬릿 배정 (공유 격벽 기준)
                 for loop_name, data in self.loop_data.items():
                     if data['area'] >= AREA_THRESHOLD: continue
-
                     for seg in data['segments']:
                         if seg['is_shared']:
                             for other_loop in seg['shared_with']:
                                 if self.loop_data[other_loop]['area'] >= AREA_THRESHOLD: continue
-
                                 pair = tuple(sorted([loop_name, other_loop]))
                                 if pair not in processed_pairs:
                                     processed_pairs.add(pair)
-
                                     shared_geoms = [s['line_geometry'] for s in data['segments'] if
                                                     other_loop in s['shared_with']]
                                     if shared_geoms:
                                         merged_shared = linemerge(shared_geoms)
-                                        if merged_shared.geom_type == 'MultiLineString':
-                                            merged_shared = max(list(merged_shared.geoms),
-                                                                key=lambda x: x.length)
-
+                                        if merged_shared.geom_type == 'MultiLineString': merged_shared = max(
+                                            list(merged_shared.geoms), key=lambda x: x.length)
                                         mid_pt = merged_shared.interpolate(0.5, normalized=True)
                                         slit_map[pair] = mid_pt
                                         virtual_slits.add((round(mid_pt.x, 3), round(mid_pt.y, 3)))
 
-                # L1의 Global Flow Start (수직 부재 중앙) 미리 탐색
-                # L1의 Global Flow Start (수직 부재 중앙) 미리 탐색
+                # ✨ 2. [요구사항] 루프 갯수와 슬릿 갯수 비교 후 중심축에 슬릿 강제 생성
+                num_loops = sum(1 for d in self.loop_data.values() if d['area'] < AREA_THRESHOLD)
+                num_slits = len(virtual_slits)
+                extra_slits_map = {}
+
+                if num_slits < num_loops:
+                    # 슬릿(다음 루프로 연결되는 경로)이 없는 마지막(Terminal) 루프 찾기
+                    for idx, poly in enumerate(filtered_loops):
+                        loop_name = f"L{idx + 1}"
+                        if self.loop_data[loop_name]['area'] >= AREA_THRESHOLD: continue
+
+                        l_segs = self.loop_data[loop_name]['segments']
+                        adj_loops = set(
+                            ol for s in l_segs if s['is_shared'] for ol in s['shared_with'] if
+                            self.loop_data[ol]['area'] < AREA_THRESHOLD)
+                        next_loops = [ol for ol in adj_loops if int(ol[1:]) > idx + 1]
+
+                        if not next_loops:
+                            centerline_segs = []
+                            for s in l_segs:
+                                if not s['is_shared']:
+                                    n1, n2 = s['nodes']
+                                    # 중심선(x_cut)과 맞닿거나 겹치는 선분 식별 (오차 허용 5.0mm)
+                                    if abs(n1[0] - x_cut) < 5.0 or abs(n2[0] - x_cut) < 5.0:
+                                        centerline_segs.append(s)
+
+                            if centerline_segs:
+                                # 중심선과 겹치는 선분 중 Y좌표가 가장 높은 부재(Deck 등)의 정중앙에 슬릿 생성
+                                top_seg = max(centerline_segs,
+                                              key=lambda s: max(s['nodes'][0][1], s['nodes'][1][1]))
+                                geom = top_seg['line_geometry']
+                                mid_pt = geom.interpolate(0.5, normalized=True)
+
+                                virtual_slits.add((round(mid_pt.x, 3), round(mid_pt.y, 3)))
+                                extra_slits_map[loop_name] = mid_pt
+
                 l1_start_pt = None
                 if 'L1' in self.loop_data and self.loop_data['L1']['area'] < AREA_THRESHOLD:
                     outer_segs = [s for s in self.loop_data['L1']['segments'] if not s['is_shared']]
@@ -1595,52 +1633,36 @@ class UltimateShipAnalyzer(QMainWindow):
                                                                                        x: x.length)
                             l1_start_pt = merged.interpolate(0.5, normalized=True)
 
-                # ---------------------------------------------------------
-                # (2) 링(Ring) 기반의 위상 수학적 흐름 라우팅 (방향 분배)
-                # ---------------------------------------------------------
                 drawn_segments = set()
 
                 def in_interval(d, s, e):
-                    if s <= e: return s <= d <= e
-                    return d >= s or d <= e
+                    return s <= d <= e if s <= e else (d >= s or d <= e)
 
                 def draw_split_flow(geom, pt, is_sink, seg):
                     d_pt = geom.project(pt, normalized=True)
-                    # ✨ 0.01 예외처리를 지우고 원래의 0.05 ~ 0.95 범위로 롤백했습니다.
                     if 0.05 < d_pt < 0.95:
                         pt1 = geom.interpolate(d_pt / 2.0, normalized=True)
                         pt2 = geom.interpolate((1.0 + d_pt) / 2.0, normalized=True)
-
-                        coords = list(geom.coords)
-                        seg_vec = np.array(coords[-1]) - np.array(coords[0])
+                        c_vec = np.array([pt.x, pt.y])
+                        seg_vec = np.array(geom.coords[-1]) - np.array(geom.coords[0])
                         u_vec = seg_vec / np.linalg.norm(seg_vec)
 
-                        c = np.array([pt.x, pt.y])
-
-                        v1 = c - np.array([pt1.x, pt1.y])
-                        f1 = u_vec if np.dot(v1, u_vec) > 0 else -u_vec
-                        if not is_sink: f1 = -f1
-
-                        v2 = c - np.array([pt2.x, pt2.y])
-                        f2 = u_vec if np.dot(v2, u_vec) > 0 else -u_vec
-                        if not is_sink: f2 = -f2
+                        f1 = u_vec if np.dot(np.array([pt1.x, pt1.y]) - c_vec, u_vec) > 0 else -u_vec
+                        f2 = u_vec if np.dot(np.array([pt2.x, pt2.y]) - c_vec, u_vec) > 0 else -u_vec
 
                         ax2.quiver(pt1.x, pt1.y, f1[0], f1[1], color='blue', scale=20, width=0.005,
                                    headwidth=5, pivot='mid', zorder=20)
                         ax2.quiver(pt2.x, pt2.y, f2[0], f2[1], color='blue', scale=20, width=0.005,
                                    headwidth=5, pivot='mid', zorder=20)
-
-                        seg['is_split'] = True
-                        seg['split_pt'] = (pt.x, pt.y)
-                        seg['is_sink'] = is_sink
-
+                        seg['is_split'], seg['split_pt'], seg['is_sink'] = True, (pt.x, pt.y), is_sink
+                        seg['info_ref']['is_split'] = True
                         return True
                     return False
 
+                # 3. 루프 내 전단류 방향 라우팅 (추가된 슬릿 반영)
                 for idx, poly in enumerate(filtered_loops):
                     loop_name = f"L{idx + 1}"
                     if self.loop_data[loop_name]['area'] >= AREA_THRESHOLD: continue
-
                     l_segs = self.loop_data[loop_name]['segments']
                     ring = self.loop_data[loop_name]['polygon'].exterior
                     L_ring = ring.length
@@ -1649,18 +1671,20 @@ class UltimateShipAnalyzer(QMainWindow):
                                     self.loop_data[ol]['area'] < AREA_THRESHOLD)
                     prev_loops = [ol for ol in adj_loops if int(ol[1:]) < idx + 1]
                     next_loops = [ol for ol in adj_loops if int(ol[1:]) > idx + 1]
-
                     prev_loop = max(prev_loops, key=lambda x: int(x[1:])) if prev_loops else None
                     next_loop = min(next_loops, key=lambda x: int(x[1:])) if next_loops else None
 
+                    # ✨ 라우팅 기준점(target_pt) 설정 시 새로 생성한 중심선 슬릿 적용
                     if next_loop:
                         target_pt = slit_map.get(tuple(sorted([loop_name, next_loop])))
                     else:
-                        # ✨ 예외 처리 렌더링(virtual_slits 추가)을 모두 걷어내고, 단순히 흐름의 방향만 잡아줍니다.
-                        target_pt = Point(max(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
+                        if loop_name in extra_slits_map:
+                            target_pt = extra_slits_map[loop_name]
+                        else:
+                            target_pt = Point(
+                                max(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
 
                     d_tgt = ring.project(target_pt)
-
                     is_l1 = (idx == 0)
                     slit_prev = None
 
@@ -1669,47 +1693,42 @@ class UltimateShipAnalyzer(QMainWindow):
                     elif prev_loop:
                         slit_prev = slit_map.get(tuple(sorted([loop_name, prev_loop])))
                         d_ps = ring.project(slit_prev)
-
                         prev_geoms = [s['line_geometry'] for s in l_segs if
                                       prev_loop in s['shared_with']]
                         merged_prev = linemerge(prev_geoms)
                         if merged_prev.geom_type == 'MultiLineString': merged_prev = max(
                             list(merged_prev.geoms), key=lambda x: x.length)
-
-                        nA = Point(merged_prev.coords[0])
-                        nB = Point(merged_prev.coords[-1])
-                        d_nA = ring.project(nA)
-                        d_nB = ring.project(nB)
-
-                        if (d_nA - d_ps) % L_ring < (d_nB - d_ps) % L_ring:
-                            d_nr, d_nl = d_nA, d_nB
-                        else:
-                            d_nr, d_nl = d_nB, d_nA
+                        d_nA, d_nB = ring.project(Point(merged_prev.coords[0])), ring.project(
+                            Point(merged_prev.coords[-1]))
+                        d_nr, d_nl = (d_nA, d_nB) if (d_nA - d_ps) % L_ring < (
+                                    d_nB - d_ps) % L_ring else (d_nB, d_nA)
                     else:
-                        lowest_node = Point(
-                            min(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
-                        d_start = ring.project(lowest_node)
+                        d_start = ring.project(
+                            Point(min(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1])))
                         is_l1 = True
 
                     for seg in l_segs:
                         geom = seg['line_geometry']
                         geom_id = id(geom)
+                        if geom_id in drawn_segments: continue
 
-                        if geom_id in drawn_segments:
+                        if seg.get('flow_vec') is not None:
+                            drawn_segments.add(geom_id)
+                            mid = geom.interpolate(0.5, normalized=True)
+                            ax2.quiver(mid.x, mid.y, seg['flow_vec'][0], seg['flow_vec'][1],
+                                       color='dodgerblue', scale=20, width=0.005, headwidth=5,
+                                       pivot='mid', zorder=20)
                             continue
 
                         handled = False
-
                         if target_pt and geom.distance(target_pt) < 1.0 and geom.length > 2.0:
-                            if draw_split_flow(geom, target_pt, True, seg): handled = True
-
+                            handled = draw_split_flow(geom, target_pt, True, seg)
                         elif not is_l1 and slit_prev and geom.distance(
-                                slit_prev) < 1.0 and geom.length > 2.0:
-                            if draw_split_flow(geom, slit_prev, False, seg): handled = True
-
+                            slit_prev) < 1.0 and geom.length > 2.0:
+                            handled = draw_split_flow(geom, slit_prev, False, seg)
                         elif is_l1 and l1_start_pt and geom.distance(
-                                l1_start_pt) < 1.0 and geom.length > 2.0:
-                            if draw_split_flow(geom, l1_start_pt, False, seg): handled = True
+                            l1_start_pt) < 1.0 and geom.length > 2.0:
+                            handled = draw_split_flow(geom, l1_start_pt, False, seg)
 
                         if handled:
                             drawn_segments.add(geom_id)
@@ -1718,9 +1737,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         drawn_segments.add(geom_id)
                         mid_pt = geom.interpolate(0.5, normalized=True)
                         d_m = ring.project(mid_pt)
-
-                        coords = list(geom.coords)
-                        seg_vec = np.array(coords[-1]) - np.array(coords[0])
+                        seg_vec = np.array(geom.coords[-1]) - np.array(geom.coords[0])
                         if np.linalg.norm(seg_vec) < 1e-6: continue
                         u_vec = seg_vec / np.linalg.norm(seg_vec)
 
@@ -1741,118 +1758,119 @@ class UltimateShipAnalyzer(QMainWindow):
                                 dir_sign = 1
 
                         flow_vec = forward_u_vec * dir_sign
-
                         seg['flow_vec'] = (flow_vec[0], flow_vec[1])
-                        seg['is_split'] = False
-
+                        seg['info_ref']['flow_vec'] = seg['flow_vec']
                         ax2.quiver(mid_pt.x, mid_pt.y, flow_vec[0], flow_vec[1], color='blue', scale=20,
                                    width=0.005, headwidth=5, pivot='mid', zorder=20)
 
-                # ---------------------------------------------------------
-                # (3) 열린 선분 (루프에 속하지 않은 부재, Open Segments)
-                # ---------------------------------------------------------
-                loop_lines = [s['line_geometry'] for data in self.loop_data.values() for s in
-                              data['segments']]
+                # 열린 선분 및 남은 찌꺼기 선분 (Open & Fallback Segments)
                 for info in cut_lines_info:
+                    if info['type'] == 'centerline_wall': continue
                     geom = info['line_geometry']
                     geom_id = id(geom)
-                    if info['type'] == 'centerline_wall' or geom.geom_type != 'LineString': continue
-                    if geom_id in drawn_segments: continue  # 안전장치
 
-                    is_open = True
-                    for lg in loop_lines:
-                        if geom.distance(lg) < 1e-3 and geom.intersection(lg).length > 1.0:
-                            is_open = False
-                            break
-                    if is_open:
-                        coords = list(geom.coords)
-                        p1, p2 = np.array(coords[0]), np.array(coords[-1])
-                        if p2[1] < p1[1]: p1, p2 = p2, p1
-                        vec = p2 - p1
-                        if np.linalg.norm(vec) > 1e-6:
-                            vec /= np.linalg.norm(vec)
+                    if geom_id not in drawn_segments:
+                        if info.get('flow_vec') is not None:
                             mid = geom.interpolate(0.5, normalized=True)
-                            ax2.quiver(mid.x, mid.y, vec[0], vec[1], color='dodgerblue', scale=20,
-                                       width=0.005, headwidth=5, pivot='mid', zorder=20)
+                            ax2.quiver(mid.x, mid.y, info['flow_vec'][0], info['flow_vec'][1], color='dodgerblue',
+                                       scale=20, width=0.005, headwidth=5, pivot='mid', zorder=20)
                             drawn_segments.add(geom_id)
+                        elif not info.get('is_split'):
+                            coords = list(geom.coords)
+                            p_start, p_end = np.array(coords[0]), np.array(coords[-1])
+                            vec = p_end - p_start if p_end[1] > p_start[1] else p_start - p_end
+                            norm = np.linalg.norm(vec)
+                            if norm > 1e-6:
+                                vec = vec / norm
+                                info['flow_vec'] = (vec[0], vec[1])
+                                for data in self.loop_data.values():
+                                    for seg in data['segments']:
+                                        if id(seg['line_geometry']) == geom_id:
+                                            seg['flow_vec'] = info['flow_vec']
+                                mid = geom.interpolate(0.5, normalized=True)
+                                ax2.quiver(mid.x, mid.y, vec[0], vec[1], color='dodgerblue', scale=20, width=0.005,
+                                           headwidth=5, pivot='mid', zorder=20)
+                                drawn_segments.add(geom_id)
 
-                # ---------------------------------------------------------
+                # ==========================================
                 # ✨ (4) 시각화 요소 마커 처리 및 노드(Nodes) 렌더링
-                # ---------------------------------------------------------
-                valid_nodes = self.get_topological_nodes(self.hull_only_centerlines)
-                if valid_nodes:
-                    # ✨ [수정] 0보다 큰 쪽(X > 0)의 노드 출력 금지 (반단면 우측 필터링)
-                    filtered_nodes = [n for n in valid_nodes if n[0] <= 1e-3]
-                    ax2.scatter([n[0] for n in filtered_nodes], [n[1] for n in filtered_nodes],
-                                color='red', s=30, zorder=30, label='Topological Nodes')
+                # ==========================================
+                bridge_nodes, slit_nodes, normal_nodes = [], [], []
 
-                if virtual_slits:
-                    sx = [pt[0] for pt in virtual_slits]
-                    sy = [pt[1] for pt in virtual_slits]
-                    ax2.scatter(sx, sy, color='red', marker='^', s=120, zorder=25,
-                                label='Virtual Slit (q=0)')
+                loop_geom_ids = set()
+                for data in self.loop_data.values():
+                    for seg in data['segments']:
+                        loop_geom_ids.add(id(seg['line_geometry']))
 
-                if l1_start_pt:
-                    ax2.scatter(l1_start_pt.x, l1_start_pt.y, color='green', marker='o', s=100,
-                                zorder=26, label='Global Flow Start')
-
-                ax2.legend(loc='upper right')
-
-                # =================================================================
-                # ✨ [추가] 정정 전단류 계산 및 결과 시각화 (안전장치 적용)
-                # =================================================================
-                try:
-                    # 1. 계산 엔진 실행
-                    self.calculate_determinate_shear_flow()
-
-                    # 2. 결과가 정상적으로 도출되었을 때만 시각화 진행
-                    if hasattr(self, 'qs_edges') and hasattr(self, 'shear_edges') and len(self.shear_edges) > 0:
-                        import matplotlib.cm as cm
-                        import matplotlib.colors as mcolors
-
-                        max_q = max([abs(data['end_q']) for data in self.qs_edges.values()] +
-                                    [abs(data['start_q']) for data in self.qs_edges.values()] + [1e-6])
-
-                        norm = mcolors.Normalize(vmin=0, vmax=max_q)
-                        cmap = cm.jet
-
-                        for i, edge in enumerate(self.shear_edges):
-                            q_val = max(abs(self.qs_edges[i]['start_q']), abs(self.qs_edges[i]['end_q']))
-                            color = cmap(norm(q_val))
-
-                            # ✨ 직선 [start, end] 좌표 대신, 저장해둔 원본 기하학 루트를 그대로 꺼냅니다!
-                            geom = edge['geom']
-                            x_coords, y_coords = geom.xy
-
-                            ax2.plot(x_coords, y_coords, color=color, linewidth=4.0, zorder=18, alpha=0.8)
-
-                        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
-                        sm.set_array([])
-
-                        # 기존 컬러바가 있으면 지우고 다시 그리기 (중복 방지)
-                        if hasattr(self, 'qs_colorbar') and self.qs_colorbar:
-                            try:
-                                self.qs_colorbar.remove()
-                            except:
-                                pass
-                        self.qs_colorbar = ax2.figure.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
-                        self.qs_colorbar.set_label('Determinate Shear Flow |qs| (mm³)', rotation=270, labelpad=15)
-
-                        result_text = (
-                            f"📊 [Shear Flow Results]\n"
-                            f"Max |qs| : {max_q:.2e} mm³\n"
-                            f"Shear N.A : {self.NA_y_shear:.2f} mm"
-                        )
-                        ax2.text(0.02, 0.98, result_text, transform=ax2.transAxes, fontsize=11, fontweight='bold',
-                                 verticalalignment='top',
-                                 bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.85), zorder=40)
+                def get_outward_vec(c, pt):
+                    if np.hypot(c[0][0] - pt[0], c[0][1] - pt[1]) < 1.0:
+                        v = np.array(c[-1]) - np.array(c[0])
                     else:
-                        print("⚠️ 전단류를 계산할 부재(edges)가 없습니다. 위상 그래프 생성을 확인하세요.")
+                        v = np.array(c[0]) - np.array(c[-1])
+                    norm = np.linalg.norm(v)
+                    return (v / norm) if norm > 1e-6 else np.array([0, 0])
 
-                except Exception as e:
-                    print(f"\n❌ 전단류 계산/시각화 중 치명적 에러 발생: {e}\n")
+                for pt, lines in global_node_map.items():
+                    if pt[0] > filter_limit: continue
+                    degree = len(lines)
 
-                # 캔버스 업데이트
+                    if degree == 2:
+                        v1 = get_outward_vec(list(lines[0]['line_geometry'].coords), pt)
+                        v2 = get_outward_vec(list(lines[1]['line_geometry'].coords), pt)
+                        if np.dot(v1, v2) > -0.996:
+                            normal_nodes.append(pt)
+
+                    elif degree >= 3:
+                        has_loop = False
+                        requires_slit = False
+
+                        for info in lines:
+                            if info.get('is_split'): continue
+                            is_loop_seg = id(info['line_geometry']) in loop_geom_ids
+                            if is_loop_seg:
+                                has_loop = True
+
+                            if info.get('flow_vec') is not None:
+                                c = list(info['line_geometry'].coords)
+                                is_fwd = np.dot(np.array(c[-1]) - np.array(c[0]), np.array(info['flow_vec'])) > 0
+                                pt_is_start = np.hypot(c[0][0] - pt[0], c[0][1] - pt[1]) < 1.0
+
+                                is_flow_in = False
+                                if pt_is_start:
+                                    if not is_fwd: is_flow_in = True
+                                else:
+                                    if is_fwd: is_flow_in = True
+
+                                if not is_loop_seg and is_flow_in:
+                                    dist_to_n1 = np.hypot(info['n1'][0] - pt[0], info['n1'][1] - pt[1])
+                                    other_n = info['n2'] if dist_to_n1 < 1.0 else info['n1']
+                                    other_degree = len(global_node_map.get(other_n, []))
+                                    if other_degree != 1:
+                                        requires_slit = True
+
+                        if has_loop and requires_slit:
+                            slit_nodes.append(pt)
+                        else:
+                            bridge_nodes.append(pt)
+
+                for vs in virtual_slits:
+                    if vs[0] > filter_limit: continue
+                    if not any(np.hypot(vs[0] - sn[0], vs[1] - sn[1]) < 1.0 for sn in slit_nodes):
+                        slit_nodes.append(vs)
+
+                if bridge_nodes: ax2.scatter([n[0] for n in bridge_nodes], [n[1] for n in bridge_nodes], color='purple',
+                                             marker='s', s=55, zorder=30, label='Bridge Node (Deg≥3)')
+                if slit_nodes: ax2.scatter([n[0] for n in slit_nodes], [n[1] for n in slit_nodes], color='red',
+                                           marker='^', s=100, zorder=31, label='Slit Node (Non-Open IN)')
+                if open_nodes: ax2.scatter([n[0] for n in open_nodes], [n[1] for n in open_nodes], color='dodgerblue',
+                                           marker='o', s=45, zorder=29, label='Open Node (Deg=1)')
+                if normal_nodes: ax2.scatter([n[0] for n in normal_nodes], [n[1] for n in normal_nodes], color='gray',
+                                             marker='o', s=20, zorder=28, label='Normal Node')
+
+                if l1_start_pt: ax2.scatter(l1_start_pt.x, l1_start_pt.y, color='green', marker='o', s=100, zorder=26,
+                                            label='Global Flow Start')
+                ax2.legend(loc='upper right')
+                # 캔버스 업데이트 (정정 전단류 계산 과정 제거됨)
             ax2.figure.canvas.draw()
 
             if 'progress' in locals():
@@ -1948,152 +1966,6 @@ class UltimateShipAnalyzer(QMainWindow):
                     pass
 
         return final_nodes
-
-    def calculate_determinate_shear_flow(self):
-        """
-        [Step 3] 정정 전단류(Determinate Shear Flow) 계산 엔진
-        - 원본 기하학(Geometry) 루트 유지 및 노드 융합
-        """
-        print("\n--- 🚀 Calculating Determinate Shear Flow (qs) ---")
-
-        from shapely.ops import substring
-        from shapely.geometry import Point, LineString
-        import numpy as np
-
-        edges = []
-        node_coords = []
-
-        def get_node_id(pt):
-            for i, n in enumerate(node_coords):
-                if np.hypot(n[0] - pt[0], n[1] - pt[1]) < 1.0:
-                    return i
-            node_coords.append((pt[0], pt[1]))
-            return len(node_coords) - 1
-
-        # ✨ [핵심 개편] 시작/끝점만 저장하지 않고, 원본 LineString 루트 전체를 방향 맞춰 저장!
-        def add_edge_geom(geom, thickness, is_forward=True):
-            if geom.length < 1e-3: return
-            coords = list(geom.coords)
-
-            # 흐름 방향이 반대라면, 원본 좌표 배열을 통째로 뒤집어줌
-            if not is_forward:
-                coords = coords[::-1]
-
-            oriented_geom = LineString(coords)
-
-            p_start, p_end = coords[0], coords[-1]
-            n_start = get_node_id(p_start)
-            n_end = get_node_id(p_end)
-
-            edges.append({
-                'start_node': n_start, 'end_node': n_end,
-                'start': node_coords[n_start], 'end': node_coords[n_end],
-                't': thickness,
-                'L': oriented_geom.length,
-                'mid_y': oriented_geom.centroid.y,
-                'geom': oriented_geom  # 💾 원본 부재의 루트(경로)를 통째로 영구 저장!
-            })
-
-        loop_geoms = []
-
-        if hasattr(self, 'loop_data'):
-            for loop_name, data in self.loop_data.items():
-                for seg in data['segments']:
-                    geom = seg['line_geometry']
-                    t = seg.get('thickness', 10.0)
-                    loop_geoms.append(geom)
-
-                    if not ('flow_vec' in seg or seg.get('is_split')):
-                        continue
-
-                    if seg.get('is_split'):
-                        pt = Point(seg['split_pt'])
-                        d_norm = geom.project(pt, normalized=True)
-                        geom1 = substring(geom, 0.0, d_norm, normalized=True)
-                        geom2 = substring(geom, d_norm, 1.0, normalized=True)
-
-                        is_sink = seg.get('is_sink', True)
-                        if is_sink:
-                            add_edge_geom(geom1, t, is_forward=True)
-                            add_edge_geom(geom2, t, is_forward=False)
-                        else:
-                            add_edge_geom(geom1, t, is_forward=False)
-                            add_edge_geom(geom2, t, is_forward=True)
-                    elif 'flow_vec' in seg:
-                        coords = list(geom.coords)
-                        vec = np.array(coords[-1]) - np.array(coords[0])
-                        f_vec = np.array(seg['flow_vec'])
-                        is_forward = np.dot(vec, f_vec) > 0
-                        add_edge_geom(geom, t, is_forward=is_forward)
-
-        if hasattr(self, 'hull_only_centerlines'):
-            for cl in self.hull_only_centerlines:
-                geom = cl['line']
-                t = cl.get('thickness', 10.0)
-
-                is_open = True
-                for lg in loop_geoms:
-                    if geom.distance(lg) < 1e-3 and geom.intersection(lg).length > 1.0:
-                        is_open = False
-                        break
-
-                if is_open and geom.geom_type == 'LineString' and geom.length > 1.0:
-                    coords = list(geom.coords)
-                    p_start, p_end = Point(coords[0]), Point(coords[-1])
-
-                    dist_start = min([p_start.distance(lg) for lg in loop_geoms]) if loop_geoms else 0
-                    dist_end = min([p_end.distance(lg) for lg in loop_geoms]) if loop_geoms else 0
-
-                    is_forward = dist_start > dist_end
-                    add_edge_geom(geom, t, is_forward=is_forward)
-
-        if not edges:
-            print("⚠️ [에러] 추출된 엣지가 0개입니다.")
-            return
-
-        total_A = sum(e['t'] * e['L'] for e in edges)
-        total_Ay = sum(e['t'] * e['L'] * e['mid_y'] for e in edges)
-        NA_y = total_Ay / total_A if total_A > 0 else 0.0
-        self.NA_y_shear = NA_y
-
-        for e in edges:
-            e['dQ'] = e['t'] * e['L'] * (e['mid_y'] - NA_y)
-
-        adj = {i: {'in': [], 'out': []} for i in range(len(node_coords))}
-        for i, e in enumerate(edges):
-            adj[e['start_node']]['out'].append(i)
-            adj[e['end_node']]['in'].append(i)
-
-        qs_nodes = {i: 0.0 for i in range(len(node_coords))}
-        qs_edges = {i: {'start_q': 0.0, 'end_q': 0.0} for i in range(len(edges))}
-
-        in_degree = {i: len(adj[i]['in']) for i in range(len(node_coords))}
-        queue = [i for i in range(len(node_coords)) if in_degree[i] == 0]
-
-        while queue:
-            curr = queue.pop(0)
-            curr_q = qs_nodes[curr]
-
-            for edge_idx in adj[curr]['out']:
-                e = edges[edge_idx]
-                qs_edges[edge_idx]['start_q'] = curr_q
-
-                end_q = curr_q + e['dQ']
-                qs_edges[edge_idx]['end_q'] = end_q
-
-                nxt = e['end_node']
-                qs_nodes[nxt] += end_q
-
-                in_degree[nxt] -= 1
-                if in_degree[nxt] == 0:
-                    queue.append(nxt)
-
-        self.qs_edges = qs_edges
-        self.shear_edges = edges
-
-        max_q = max([abs(data['end_q']) for data in qs_edges.values()] + [0])
-        print(f"✅ 정정 전단류 계산 완료! (전체 부재: {len(edges)}개, 통합 중립축: {NA_y:.2f}mm, Max Q: {max_q:.2e})")
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
