@@ -155,14 +155,6 @@ class UltimateShipAnalyzer(QMainWindow):
             setattr(self, attr, le)
             h.addWidget(le)
             gen_vbox.addLayout(h)
-        h_vy = QHBoxLayout()
-        h_vy.addWidget(QLabel("Shear Force Vy (kN):"))
-        h_vy.addStretch()
-        self.txt_vy = QLineEdit("316")  # 기본값 2만 kN (20,000,000 N)
-        self.txt_vy.setFixedWidth(self.field_width)
-        h_vy.addWidget(self.txt_vy)
-        gen_vbox.addLayout(h_vy)
-
         control_panel_layout.addWidget(gen_box)
 
         self.btn_load = QPushButton("1. DXF Load 📂")
@@ -1277,19 +1269,19 @@ class UltimateShipAnalyzer(QMainWindow):
                 c['type'] = 'stiffener'
                 c['color'] = '#FF7F0E'  # 보강재를 도면에서 식별하기 위한 주황색 지정
 
+            # 주 구조물(all_cl)에 보강재(stiff_cl) 합병
             all_cl.extend(stiff_cl)
             self.final_healed_centerlines = all_cl
 
-            # 주 구조물(all_cl)에 보강재(stiff_cl) 합병
-            # =====================================================================
-            # 1. [Rule 1] 이너시아(Inertia)는 '전체 단면'을 사용하여 정확히 계산
-            # =====================================================================
-            progress.setLabelText("Calculating Full Section Properties...")
+            progress.setLabelText("Calculating Section Properties...")
+            progress.setValue(99)
+            QApplication.processEvents()
+
             total_area = 0.0
             sum_qx = 0.0
-            sum_qy = 0.0
             segments_1d = []
 
+            # 1. 전체 면적 및 1차 모멘트(Qx) 계산
             for cl in all_cl:
                 coords = list(cl['line'].coords)
                 thk = cl.get('thickness', 10.0)
@@ -1303,104 +1295,51 @@ class UltimateShipAnalyzer(QMainWindow):
                     if L < 1e-6: continue
 
                     a = L * thk
-                    xc = (x1 + x2) / 2.0
-                    yc = (y1 + y2) / 2.0
+                    yc = (y1 + y2) / 2.0  # 선분의 무게중심 Y좌표
+
                     total_area += a
                     sum_qx += a * yc
-                    sum_qy += a * xc
-                    segments_1d.append((a, xc, yc, dx, dy, L))
+                    segments_1d.append((a, yc, dx, dy, L))
 
+            # 2. 중립축(N.A) 및 평행축 정리를 이용한 단면 2차 모멘트(Ixx) 계산
             if total_area > 0:
                 na_y = sum_qx / total_area
-                na_x = sum_qy / total_area
+                ixx = 0.0
+                ixxm = 0.0
 
-                ixx, iyy, ixy = 0.0, 0.0, 0.0
+                for a, yc, dx, dy, L in segments_1d:
+                    # 국부 관성모멘트 (Local Ixx)
+                    i_local = (a * (dy ** 2)) / 12.0
+                    # 평행축 정리
+                    ixx += i_local + a * ((yc - na_y) ** 2)
+                ixxm = ixx / 1e12
 
-                for a, xc, yc, dx, dy, L in segments_1d:
-                    i_local_x = (a * (dy ** 2)) / 12.0
-                    i_local_y = (a * (dx ** 2)) / 12.0
-                    i_local_xy = (a * dx * dy) / 12.0
-
-                    cx = xc - na_x
-                    cy = yc - na_y
-                    ixx += i_local_x + a * (cy ** 2)
-                    iyy += i_local_y + a * (cx ** 2)
-                    ixy += i_local_xy + a * cx * cy
-
+                # 추후 전단응력 계산 등을 위해 클래스 변수에 저장
                 self.calc_total_area = total_area
-                self.calc_na_x = na_x
                 self.calc_na_bl = na_y
-                self.calc_ixx = ixx / 1e12
-                self.calc_iyy = iyy / 1e12
-                self.calc_ixy = ixy / 1e12
+                self.calc_ixx = ixxm
+
+                calc_result_text = (
+                    f"\n\n📊 [Section Properties Result]\n"
+                    f"----------------------------------------\n"
+                    f"- Total Area (단면적)    : {total_area:,.2f} mm²\n"
+                    f"- N.A from Base (중립축) : {na_y:,.2f} mm\n"
+                    f"- Moment of Inertia (I_xx): {ixxm:,.2e} m⁴\n"
+                    f"----------------------------------------\n"
+                )
             else:
-                self.calc_total_area = self.calc_na_x = self.calc_na_bl = 0.0
-                self.calc_ixx = self.calc_iyy = self.calc_ixy = 0.0
-
-            # =====================================================================
-            # 2. [Rule 2 & 3] Centerline 식별 후 Port 부분(기준선 왼쪽)만 절단
-            # =====================================================================
-            progress.setLabelText("Extracting Port Half-Section (Left Side)...")
-            max_y_global = -float('inf')
-            highest_xs = []
-
-            for cl in self.hull_only_centerlines:
-                for cx, cy in cl['line'].coords:
-                    if cy > max_y_global + 1e-3:
-                        max_y_global = cy
-                        highest_xs = [cx]
-                    elif abs(cy - max_y_global) <= 1e-3:
-                        highest_xs.append(cx)
-
-            x_cut = sum(highest_xs) / len(highest_xs) if highest_xs else 0.0
-            self.centerline_x = x_cut
-
-            from shapely.geometry import box
-            # ★ 기준선(x_cut) 보다 작거나 같은 왼쪽(Port)을 살리기 위한 컷팅 박스
-            keep_box = box(-9999999.0, -9999999.0, x_cut + 1.0, 9999999.0)
-
-            def slice_half_section(centerlines_list):
-                half_list = []
-                for cl in centerlines_list:
-                    clipped = cl['line'].intersection(keep_box)
-                    if clipped.is_empty: continue
-
-                    geoms = [clipped] if clipped.geom_type == 'LineString' else list(
-                        clipped.geoms) if clipped.geom_type == 'MultiLineString' else []
-                    for g in geoms:
-                        if g.length > 1.0:
-                            new_cl = cl.copy()
-                            new_cl['line'] = g
-                            half_list.append(new_cl)
-                return weld_vertices(half_list, weld_tol=1.0)
-
-                # 전단류 계산을 위해 Port 측 절반만 남김
-
-            all_cl = slice_half_section(all_cl)
-            self.final_healed_centerlines = all_cl
-            self.hull_only_centerlines = slice_half_section(self.hull_only_centerlines)
-
-            calc_result_text = (
-                f"\n\n📊 [Section Properties (Full Section)]\n"
-                f"----------------------------------------\n"
-                f"- Centerline X     : {self.centerline_x:,.2f} mm\n"
-                f"- Total Area       : {self.calc_total_area:,.2f} mm²\n"
-                f"- Moment of I_xx   : {self.calc_ixx:,.2e} m⁴\n"
-                f"- Moment of I_yy   : {self.calc_iyy:,.2e} m⁴\n"
-                f"- Product of I_xy  : {self.calc_ixy:,.2e} m⁴\n"
-                f"----------------------------------------\n"
-            )
+                calc_result_text = "\n\n❌ 유효한 단면적이 없어 이너시아를 계산할 수 없습니다."
 
             # 3. 결과창 출력 텍스트 업데이트
             summary_text = (
-                f"✅ Port Half-Section (Left) Extraction Complete!\n\n"
-                f"- Extracted Port-side Members: {len(all_cl)}"
+                "✅ 1D Transformation & Full Healing Complete!\n\n"
+                f"- Extracted Outer Hull Lines (1999): {len(cl1999)}\n"
+                f"- Aligned Internal Lines (1102, 157): {len(self.aligned_internal)}\n"
+                f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
+                f"- Final Healed Elements: {len(all_cl)}"
                 f"{calc_result_text}"
             )
             self.result_box.setText(summary_text)
-
-            progress.setLabelText("Building Topology and Calculating Shear Flow...")
-            self.build_topology_and_calculate_flow()
 
             self.is_calculated = True
             progress.setValue(100)
@@ -1422,82 +1361,525 @@ class UltimateShipAnalyzer(QMainWindow):
 
         if self.is_calculated:
             # ----------------------------------------------------
-            # [도면 1] 틈새 보정 완료된 최종 1D 형상 뷰
+            # [도면 1 (ax1): 틈새 보정 완료된 최종 1D 형상 뷰 (보강재 포함)]
             # ----------------------------------------------------
             if hasattr(self, 'final_healed_centerlines'):
                 for cl in self.final_healed_centerlines:
                     lo = cl['line']
                     x, y = lo.xy
+
                     c_type = cl.get('type')
                     final_color = '#000000' if c_type == '1999' else ('#FF7F0E' if c_type == 'stiffener' else '#003087')
+                    thk = cl.get('thickness', 10.0)
+
+                    # ✨ 시각화용 두께 과장 (실제 계산 결과에는 영향 없음)
+                    visual_thk = thk if thk >= 50.0 else 50.0
+
+                    if visual_thk > 0:
+                        try:
+                            poly = lo.buffer(visual_thk / 2.0, cap_style=2)
+                            if poly.geom_type == 'Polygon':
+                                ax1.fill(*poly.exterior.xy, color=final_color, alpha=0.3, zorder=9, edgecolor='none')
+                            elif poly.geom_type == 'MultiPolygon':
+                                for p in poly.geoms:
+                                    ax1.fill(*p.exterior.xy, color=final_color, alpha=0.3, zorder=9, edgecolor='none')
+                        except:
+                            pass
                     ax1.plot(x, y, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
             # ----------------------------------------------------
-            # [도면 2] 폐루프(Closed Loop) 및 위상 노드 시각화 뷰
+            # [도면 2 (ax2): 보강재 제외 주 구조물 폐루프(Closed Loop) 컷팅 뷰]
             # ----------------------------------------------------
-            if hasattr(self, 'cut_lines_info'):
-                # 1. Base Lines (회색 밑그림)
-                for info in self.cut_lines_info:
-                    g = info['line_geometry']
-                    x, y = g.xy
-                    ax2.plot(x, y, color='black', linewidth=1.5, alpha=0.3, zorder=5)
+            if hasattr(self, 'hull_only_centerlines'):
+                import colorsys
+                from shapely.geometry import box, LineString
+                from shapely.ops import polygonize
 
-                # 2. X-Cut 기준선 (중앙 절단선)
-                if hasattr(self, 'x_cut'):
-                    ax2.axvline(x=self.x_cut, color='red', linestyle='--', linewidth=1.5, zorder=20, alpha=0.7)
+                max_y_global = -float('inf')
+                highest_xs = []
 
-                # 3. 🌟 루프 폴리곤(Polygon) 형상 및 라벨 강조 렌더링
-                import matplotlib.colors as mcolors
-                colors = list(mcolors.TABLEAU_COLORS.values())  # 다양한 색상 팔레트
+                # 1. 가장 높은 Y값 및 해당 지점의 X좌표들(겹침 포함) 탐색
+                for cl in self.hull_only_centerlines:
+                    for cx, cy in cl['line'].coords:
+                        if cy > max_y_global + 1e-3:
+                            max_y_global = cy
+                            highest_xs = [cx]
+                        elif abs(cy - max_y_global) <= 1e-3:
+                            highest_xs.append(cx)
 
-                if hasattr(self, 'loop_data'):
-                    for i, (name, data) in enumerate(self.loop_data.items()):
-                        # 찾은 루프의 외곽선을 고유한 색상으로 굵게 그립니다.
-                        poly_ext = data['polygon'].exterior
-                        px, py = poly_ext.xy
-                        loop_color = colors[i % len(colors)]
-                        ax2.plot(px, py, color=loop_color, linewidth=3.0, alpha=0.8, zorder=10)
+                # 2. X 컷팅 라인 설정 (평균값 도출)
+                x_cut = sum(highest_xs) / len(highest_xs) if highest_xs else 0.0
 
-                        # 루프 정중앙에 L1, L2 등의 텍스트 라벨을 그립니다.
-                        cx, cy = data['centroid']
-                        ax2.text(cx, cy, name, color='black', fontsize=12, fontweight='bold',
-                                 ha='center', va='center',
-                                 bbox=dict(facecolor='white', alpha=0.9, edgecolor=loop_color, pad=3), zorder=15)
+                # ==========================================
+                # ✨ 3. 물리적인 1D 선분 컷팅 (메타데이터 보존)
+                # ==========================================
+                keep_box = box(-9999999.0, -9999999.0, x_cut + 0.5, 9999999.0)
 
-                # 4. 🌟 위상 노드 (Topological Nodes) 마커 표시
+                # 단순히 선(Line)만 남기는게 아니라, 두께와 속성을 함께 기억합니다.
+                cut_lines_info = []
+                cut_geoms = []
+
+                for cl in self.hull_only_centerlines:
+                    lo = cl['line']
+                    clipped = lo.intersection(keep_box)
+                    if clipped.is_empty: continue
+
+                    geoms = [clipped] if clipped.geom_type == 'LineString' else \
+                        list(clipped.geoms) if clipped.geom_type == 'MultiLineString' else []
+
+                    for g in geoms:
+                        if g.length > 1.0:
+                            cut_lines_info.append({
+                                'line_geometry': g,
+                                'thickness': cl.get('thickness', 10.0),
+                                'type': cl.get('type', 'unknown')
+                            })
+                            cut_geoms.append(g)
+
+                            x, y = g.xy
+                            ax2.plot(x, y, color='black', linewidth=1.5, alpha=0.4, zorder=5)
+
+                # ✨ 4. 가상의 Centerline 벽 생성 (두께 0.0 부여)
+                min_y_global = min([min(g.xy[1]) for g in cut_geoms]) if cut_geoms else -1000.0
+                centerline_boundary = LineString([(x_cut, min_y_global - 1000), (x_cut, max_y_global + 1000)])
+                cut_lines_info.append(
+                    {'line_geometry': centerline_boundary, 'thickness': 0.0, 'type': 'centerline_wall'})
+                cut_geoms.append(centerline_boundary)
+
+                # ==========================================
+                # ✨ 5. 폐루프(구획) 탐색 및 정렬
+                # ==========================================
+                raw_loops = list(polygonize(cut_geoms))
+
+                filtered_loops = []
+                for poly in raw_loops:
+                    if poly.area >= 1000.0 and poly.centroid.x < x_cut - 10.0:
+                        filtered_loops.append(poly)
+
+                AREA_THRESHOLD = 50 * 1000 * 1000
+                global_centroid_y = sum(p.centroid.y * p.area for p in filtered_loops) / sum(
+                    p.area for p in filtered_loops) if filtered_loops else 0.0
+
+                def loop_sort_key(poly):
+                    is_large = poly.area >= AREA_THRESHOLD
+                    dist_y = round(poly.centroid.y, -2)
+                    sort_x = -poly.centroid.x if poly.centroid.y < global_centroid_y else poly.centroid.x
+                    return (is_large, dist_y, sort_x)
+
+                filtered_loops.sort(key=loop_sort_key)
+
+                # 7. 기준선 시각화
+                ax2.axvline(x=x_cut, color='gray', linestyle='--', linewidth=1, zorder=20, alpha=0.7)
+
+                # ==========================================
+                # ✨ 8. [핵심] 완벽한 위상 데이터베이스(Topology DB) 구축
+                # 각 루프의 선분, 두께, 노드, 공유 격벽 여부를 모두 저장합니다.
+                # ==========================================
+                self.loop_data = {}
+
+                # [1차 순회] 각 루프에 속하는 선분들과 노드(Vertices) 추출
+                for idx, poly in enumerate(filtered_loops):
+                    loop_name = f"L{idx + 1}"
+                    boundary = poly.boundary
+                    segs_in_loop = []
+                    loop_nodes = set()
+
+                    for info in cut_lines_info:
+                        geom = info['line_geometry']
+                        # 현재 선분이 루프 테두리에 속해 있는지 검사
+                        if boundary.intersection(geom).length > 1.0:
+                            coords = list(geom.coords)
+                            node_start = (round(coords[0][0], 2), round(coords[0][1], 2))
+                            node_end = (round(coords[-1][0], 2), round(coords[-1][1], 2))
+
+                            seg_data = {
+                                'line_geometry': geom,
+                                'thickness': info['thickness'],
+                                'type': info['type'],
+                                'length': geom.length,
+                                'nodes': (node_start, node_end),
+                                'is_shared': False,  # 초기값
+                                'shared_with': []  # 초기값
+                            }
+                            segs_in_loop.append(seg_data)
+                            loop_nodes.add(node_start)
+                            loop_nodes.add(node_end)
+
+                    self.loop_data[loop_name] = {
+                        'polygon': poly,
+                        'area': poly.area,
+                        'centroid': (poly.centroid.x, poly.centroid.y),
+                        'segments': segs_in_loop,
+                        'nodes': list(loop_nodes)
+                    }
+
+                    # 시각화 (기존 텍스트 라벨링)
+                    cx, cy = poly.centroid.x, poly.centroid.y
+                    ax2.text(cx, cy, loop_name, color='black', fontsize=10, fontweight='bold',
+                             ha='center', va='center', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=2),
+                             zorder=15)
+
+                # [2차 순회] 이중 루프 검사를 통해 '공유 격벽(Shared Bulkhead)' 완벽 식별
+                loop_names = list(self.loop_data.keys())
+                for i in range(len(loop_names)):
+                    for j in range(i + 1, len(loop_names)):
+                        name_A = loop_names[i]
+                        name_B = loop_names[j]
+
+                        for segA in self.loop_data[name_A]['segments']:
+                            for segB in self.loop_data[name_B]['segments']:
+                                # 물리적으로 동일한 선분이라면 공유 격벽으로 판정
+                                if segA['line_geometry'].equals_exact(segB['line_geometry'], 1e-3):
+                                    segA['is_shared'] = True
+                                    segA['shared_with'].append(name_B)
+
+                                    segB['is_shared'] = True
+                                    segB['shared_with'].append(name_A)
+
+                # ==========================================
+                # ✨ 9. 전 구간 체인(Chain) 전단류 흐름 분배 및 가상 슬릿 네트워크
+                # ==========================================
+                from shapely.geometry import Point
+                from shapely.ops import linemerge
+                import numpy as np
+
+                AREA_THRESHOLD = 50 * 1000 * 1000
+                slit_map = {}
+                virtual_slits = set()
+                processed_pairs = set()
+
+                # ---------------------------------------------------------
+                # (1) 모든 공유 격벽 병합 및 엄선된 단일 가상 슬릿(정중앙) 배치
+                # ---------------------------------------------------------
+                for loop_name, data in self.loop_data.items():
+                    if data['area'] >= AREA_THRESHOLD: continue
+
+                    for seg in data['segments']:
+                        if seg['is_shared']:
+                            for other_loop in seg['shared_with']:
+                                if self.loop_data[other_loop]['area'] >= AREA_THRESHOLD: continue
+
+                                pair = tuple(sorted([loop_name, other_loop]))
+                                if pair not in processed_pairs:
+                                    processed_pairs.add(pair)
+
+                                    shared_geoms = [s['line_geometry'] for s in data['segments'] if
+                                                    other_loop in s['shared_with']]
+                                    if shared_geoms:
+                                        merged_shared = linemerge(shared_geoms)
+                                        if merged_shared.geom_type == 'MultiLineString':
+                                            merged_shared = max(list(merged_shared.geoms),
+                                                                key=lambda x: x.length)
+
+                                        mid_pt = merged_shared.interpolate(0.5, normalized=True)
+                                        slit_map[pair] = mid_pt
+                                        virtual_slits.add((round(mid_pt.x, 3), round(mid_pt.y, 3)))
+
+                # L1의 Global Flow Start (수직 부재 중앙) 미리 탐색
+                # L1의 Global Flow Start (수직 부재 중앙) 미리 탐색
+                l1_start_pt = None
+                if 'L1' in self.loop_data and self.loop_data['L1']['area'] < AREA_THRESHOLD:
+                    outer_segs = [s for s in self.loop_data['L1']['segments'] if not s['is_shared']]
+                    vert_segs = [s for s in outer_segs if abs(
+                        list(s['line_geometry'].coords)[-1][1] - list(s['line_geometry'].coords)[0][
+                            1]) > abs(
+                        list(s['line_geometry'].coords)[-1][0] - list(s['line_geometry'].coords)[0][0])]
+                    if vert_segs:
+                        max_x = max(s['line_geometry'].bounds[2] for s in vert_segs)
+                        outer_max_x = [s['line_geometry'] for s in vert_segs if
+                                       abs(s['line_geometry'].bounds[2] - max_x) < 10.0]
+                        if outer_max_x:
+                            merged = linemerge(outer_max_x)
+                            if merged.geom_type == 'MultiLineString': merged = max(list(merged.geoms),
+                                                                                   key=lambda
+                                                                                       x: x.length)
+                            l1_start_pt = merged.interpolate(0.5, normalized=True)
+
+                # ---------------------------------------------------------
+                # (2) 링(Ring) 기반의 위상 수학적 흐름 라우팅 (방향 분배)
+                # ---------------------------------------------------------
+                drawn_segments = set()
+
+                def in_interval(d, s, e):
+                    if s <= e: return s <= d <= e
+                    return d >= s or d <= e
+
+                def draw_split_flow(geom, pt, is_sink, seg):
+                    d_pt = geom.project(pt, normalized=True)
+                    # ✨ 0.01 예외처리를 지우고 원래의 0.05 ~ 0.95 범위로 롤백했습니다.
+                    if 0.05 < d_pt < 0.95:
+                        pt1 = geom.interpolate(d_pt / 2.0, normalized=True)
+                        pt2 = geom.interpolate((1.0 + d_pt) / 2.0, normalized=True)
+
+                        coords = list(geom.coords)
+                        seg_vec = np.array(coords[-1]) - np.array(coords[0])
+                        u_vec = seg_vec / np.linalg.norm(seg_vec)
+
+                        c = np.array([pt.x, pt.y])
+
+                        v1 = c - np.array([pt1.x, pt1.y])
+                        f1 = u_vec if np.dot(v1, u_vec) > 0 else -u_vec
+                        if not is_sink: f1 = -f1
+
+                        v2 = c - np.array([pt2.x, pt2.y])
+                        f2 = u_vec if np.dot(v2, u_vec) > 0 else -u_vec
+                        if not is_sink: f2 = -f2
+
+                        ax2.quiver(pt1.x, pt1.y, f1[0], f1[1], color='blue', scale=20, width=0.005,
+                                   headwidth=5, pivot='mid', zorder=20)
+                        ax2.quiver(pt2.x, pt2.y, f2[0], f2[1], color='blue', scale=20, width=0.005,
+                                   headwidth=5, pivot='mid', zorder=20)
+
+                        seg['is_split'] = True
+                        seg['split_pt'] = (pt.x, pt.y)
+                        seg['is_sink'] = is_sink
+
+                        return True
+                    return False
+
+                for idx, poly in enumerate(filtered_loops):
+                    loop_name = f"L{idx + 1}"
+                    if self.loop_data[loop_name]['area'] >= AREA_THRESHOLD: continue
+
+                    l_segs = self.loop_data[loop_name]['segments']
+                    ring = self.loop_data[loop_name]['polygon'].exterior
+                    L_ring = ring.length
+
+                    adj_loops = set(ol for s in l_segs if s['is_shared'] for ol in s['shared_with'] if
+                                    self.loop_data[ol]['area'] < AREA_THRESHOLD)
+                    prev_loops = [ol for ol in adj_loops if int(ol[1:]) < idx + 1]
+                    next_loops = [ol for ol in adj_loops if int(ol[1:]) > idx + 1]
+
+                    prev_loop = max(prev_loops, key=lambda x: int(x[1:])) if prev_loops else None
+                    next_loop = min(next_loops, key=lambda x: int(x[1:])) if next_loops else None
+
+                    if next_loop:
+                        target_pt = slit_map.get(tuple(sorted([loop_name, next_loop])))
+                    else:
+                        # ✨ 예외 처리 렌더링(virtual_slits 추가)을 모두 걷어내고, 단순히 흐름의 방향만 잡아줍니다.
+                        target_pt = Point(max(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
+
+                    d_tgt = ring.project(target_pt)
+
+                    is_l1 = (idx == 0)
+                    slit_prev = None
+
+                    if is_l1 and l1_start_pt:
+                        d_start = ring.project(l1_start_pt)
+                    elif prev_loop:
+                        slit_prev = slit_map.get(tuple(sorted([loop_name, prev_loop])))
+                        d_ps = ring.project(slit_prev)
+
+                        prev_geoms = [s['line_geometry'] for s in l_segs if
+                                      prev_loop in s['shared_with']]
+                        merged_prev = linemerge(prev_geoms)
+                        if merged_prev.geom_type == 'MultiLineString': merged_prev = max(
+                            list(merged_prev.geoms), key=lambda x: x.length)
+
+                        nA = Point(merged_prev.coords[0])
+                        nB = Point(merged_prev.coords[-1])
+                        d_nA = ring.project(nA)
+                        d_nB = ring.project(nB)
+
+                        if (d_nA - d_ps) % L_ring < (d_nB - d_ps) % L_ring:
+                            d_nr, d_nl = d_nA, d_nB
+                        else:
+                            d_nr, d_nl = d_nB, d_nA
+                    else:
+                        lowest_node = Point(
+                            min(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
+                        d_start = ring.project(lowest_node)
+                        is_l1 = True
+
+                    for seg in l_segs:
+                        geom = seg['line_geometry']
+                        geom_id = id(geom)
+
+                        if geom_id in drawn_segments:
+                            continue
+
+                        handled = False
+
+                        if target_pt and geom.distance(target_pt) < 1.0 and geom.length > 2.0:
+                            if draw_split_flow(geom, target_pt, True, seg): handled = True
+
+                        elif not is_l1 and slit_prev and geom.distance(
+                                slit_prev) < 1.0 and geom.length > 2.0:
+                            if draw_split_flow(geom, slit_prev, False, seg): handled = True
+
+                        elif is_l1 and l1_start_pt and geom.distance(
+                                l1_start_pt) < 1.0 and geom.length > 2.0:
+                            if draw_split_flow(geom, l1_start_pt, False, seg): handled = True
+
+                        if handled:
+                            drawn_segments.add(geom_id)
+                            continue
+
+                        drawn_segments.add(geom_id)
+                        mid_pt = geom.interpolate(0.5, normalized=True)
+                        d_m = ring.project(mid_pt)
+
+                        coords = list(geom.coords)
+                        seg_vec = np.array(coords[-1]) - np.array(coords[0])
+                        if np.linalg.norm(seg_vec) < 1e-6: continue
+                        u_vec = seg_vec / np.linalg.norm(seg_vec)
+
+                        p_next = ring.interpolate((d_m + 1.0) % L_ring)
+                        ring_fwd = np.array([p_next.x - mid_pt.x, p_next.y - mid_pt.y])
+                        forward_u_vec = u_vec if np.dot(u_vec, ring_fwd) > 0 else -u_vec
+
+                        if is_l1:
+                            dir_sign = 1 if in_interval(d_m, d_start, d_tgt) else -1
+                        else:
+                            if in_interval(d_m, d_ps, d_nr):
+                                dir_sign = -1
+                            elif in_interval(d_m, d_nr, d_tgt):
+                                dir_sign = 1
+                            elif in_interval(d_m, d_tgt, d_nl):
+                                dir_sign = -1
+                            else:
+                                dir_sign = 1
+
+                        flow_vec = forward_u_vec * dir_sign
+
+                        seg['flow_vec'] = (flow_vec[0], flow_vec[1])
+                        seg['is_split'] = False
+
+                        ax2.quiver(mid_pt.x, mid_pt.y, flow_vec[0], flow_vec[1], color='blue', scale=20,
+                                   width=0.005, headwidth=5, pivot='mid', zorder=20)
+
+                # ---------------------------------------------------------
+                # (3) 열린 선분 (루프에 속하지 않은 부재, Open Segments)
+                # ---------------------------------------------------------
+                loop_lines = [s['line_geometry'] for data in self.loop_data.values() for s in
+                              data['segments']]
+                for info in cut_lines_info:
+                    geom = info['line_geometry']
+                    geom_id = id(geom)
+                    if info['type'] == 'centerline_wall' or geom.geom_type != 'LineString': continue
+                    if geom_id in drawn_segments: continue  # 안전장치
+
+                    is_open = True
+                    for lg in loop_lines:
+                        if geom.distance(lg) < 1e-3 and geom.intersection(lg).length > 1.0:
+                            is_open = False
+                            break
+                    if is_open:
+                        coords = list(geom.coords)
+                        p1, p2 = np.array(coords[0]), np.array(coords[-1])
+                        if p2[1] < p1[1]: p1, p2 = p2, p1
+                        vec = p2 - p1
+                        if np.linalg.norm(vec) > 1e-6:
+                            vec /= np.linalg.norm(vec)
+                            mid = geom.interpolate(0.5, normalized=True)
+                            ax2.quiver(mid.x, mid.y, vec[0], vec[1], color='dodgerblue', scale=20,
+                                       width=0.005, headwidth=5, pivot='mid', zorder=20)
+                            drawn_segments.add(geom_id)
+
+                # ---------------------------------------------------------
+                # ✨ (4) 시각화 요소 마커 처리 및 노드(Nodes) 렌더링
+                # ---------------------------------------------------------
                 valid_nodes = self.get_topological_nodes(self.hull_only_centerlines)
                 if valid_nodes:
-                    # x가 0 이하인(좌측 반단면) 노드들만 필터링하여 파란색 원으로 표시
+                    # ✨ [수정] 0보다 큰 쪽(X > 0)의 노드 출력 금지 (반단면 우측 필터링)
                     filtered_nodes = [n for n in valid_nodes if n[0] <= 1e-3]
                     ax2.scatter([n[0] for n in filtered_nodes], [n[1] for n in filtered_nodes],
-                                color='dodgerblue', edgecolor='white', s=60, zorder=30, label='Topological Nodes')
+                                color='red', s=30, zorder=30, label='Topological Nodes')
 
-                # 상단 결과 텍스트 안내 추가
-                result_text = f"🧩 [Topology Results]\nClosed Loops: {len(self.loop_data)} ea\nValid Nodes: {len(filtered_nodes)} ea"
-                ax2.text(0.02, 0.98, result_text, transform=ax2.transAxes, fontsize=11, fontweight='bold',
-                         verticalalignment='top',
-                         bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.85), zorder=40)
+                if virtual_slits:
+                    sx = [pt[0] for pt in virtual_slits]
+                    sy = [pt[1] for pt in virtual_slits]
+                    ax2.scatter(sx, sy, color='red', marker='^', s=120, zorder=25,
+                                label='Virtual Slit (q=0)')
+
+                if l1_start_pt:
+                    ax2.scatter(l1_start_pt.x, l1_start_pt.y, color='green', marker='o', s=100,
+                                zorder=26, label='Global Flow Start')
 
                 ax2.legend(loc='upper right')
+
+                # =================================================================
+                # ✨ [추가] 정정 전단류 계산 및 결과 시각화 (안전장치 적용)
+                # =================================================================
+                try:
+                    # 1. 계산 엔진 실행
+                    self.calculate_determinate_shear_flow()
+
+                    # 2. 결과가 정상적으로 도출되었을 때만 시각화 진행
+                    if hasattr(self, 'qs_edges') and hasattr(self, 'shear_edges') and len(self.shear_edges) > 0:
+                        import matplotlib.cm as cm
+                        import matplotlib.colors as mcolors
+
+                        max_q = max([abs(data['end_q']) for data in self.qs_edges.values()] +
+                                    [abs(data['start_q']) for data in self.qs_edges.values()] + [1e-6])
+
+                        norm = mcolors.Normalize(vmin=0, vmax=max_q)
+                        cmap = cm.jet
+
+                        for i, edge in enumerate(self.shear_edges):
+                            q_val = max(abs(self.qs_edges[i]['start_q']), abs(self.qs_edges[i]['end_q']))
+                            color = cmap(norm(q_val))
+
+                            # ✨ 직선 [start, end] 좌표 대신, 저장해둔 원본 기하학 루트를 그대로 꺼냅니다!
+                            geom = edge['geom']
+                            x_coords, y_coords = geom.xy
+
+                            ax2.plot(x_coords, y_coords, color=color, linewidth=4.0, zorder=18, alpha=0.8)
+
+                        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+                        sm.set_array([])
+
+                        # 기존 컬러바가 있으면 지우고 다시 그리기 (중복 방지)
+                        if hasattr(self, 'qs_colorbar') and self.qs_colorbar:
+                            try:
+                                self.qs_colorbar.remove()
+                            except:
+                                pass
+                        self.qs_colorbar = ax2.figure.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
+                        self.qs_colorbar.set_label('Determinate Shear Flow |qs| (mm³)', rotation=270, labelpad=15)
+
+                        result_text = (
+                            f"📊 [Shear Flow Results]\n"
+                            f"Max |qs| : {max_q:.2e} mm³\n"
+                            f"Shear N.A : {self.NA_y_shear:.2f} mm"
+                        )
+                        ax2.text(0.02, 0.98, result_text, transform=ax2.transAxes, fontsize=11, fontweight='bold',
+                                 verticalalignment='top',
+                                 bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.85), zorder=40)
+                    else:
+                        print("⚠️ 전단류를 계산할 부재(edges)가 없습니다. 위상 그래프 생성을 확인하세요.")
+
+                except Exception as e:
+                    print(f"\n❌ 전단류 계산/시각화 중 치명적 에러 발생: {e}\n")
+
+                # 캔버스 업데이트
+            ax2.figure.canvas.draw()
+
+            if 'progress' in locals():
+                progress.close()
+
+
         else:
-            # 연산 전(DXF 로드 직후) 기본 밑그림 표시
+            # ----------------------------------------------------
+            # 계산(1D 변환) 전 원본 DXF 렌더링
+            # ----------------------------------------------------
             if hasattr(self, 'raw_1999_lines') and self.raw_1999_lines:
                 for ls in self.raw_1999_lines:
                     x, y = ls.xy
                     ax1.plot(x, y, color='black', lw=1.2, alpha=0.8, zorder=5)
                     ax2.plot(x, y, color='black', lw=1.2, alpha=0.8, zorder=5)
 
-        # 축 설정 (비율 1:1, 그리드 등)
+        # ----------------------------------------------------
+        # 캔버스 공통 세팅 및 그리기 (매우 중요: 이게 없으면 화면에 안 뜸)
+        # ----------------------------------------------------
         for ax in [ax1, ax2]:
-            from matplotlib.ticker import FuncFormatter
             ax.set_aspect('equal')
-            ax.grid(True, lw=0.3, linestyle='--')
-            # x축을 양수로 표시하기 위한 포매터 (Ship 좌표계 관행)
+            ax.grid(True, lw=0.3)
             ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{-x:g}"))
 
         self.can1.draw()
         self.can2.draw()
-        
+
     def get_topological_nodes(self, centerlines, tolerance=1.0):
         """
         교차점 노드를 추출하되, '일직선 상에 있으면서 두께 변화가 없는' 불필요한 노드는 탈락시킵니다.
@@ -1567,336 +1949,151 @@ class UltimateShipAnalyzer(QMainWindow):
 
         return final_nodes
 
-    def build_topology_and_calculate_flow(self):
-        """[수정] 폐루프 탐색 및 루프/노드 데이터베이스 구축까지만 수행하도록 단축된 메서드"""
-        print("\n--- 🧩 Building Topology (Loops & Nodes Only) ---")
-        from shapely.geometry import box, LineString, Point
-        from shapely.ops import polygonize, linemerge
-        import numpy as np
-
-        if not hasattr(self, 'hull_only_centerlines') or not self.hull_only_centerlines:
-            return
-
-        # 1. 반단면 컷팅 (x_cut) 및 폐루프 탐색
-        max_y_global = -float('inf')
-        highest_xs = []
-        for cl in self.hull_only_centerlines:
-            for cx, cy in cl['line'].coords:
-                if cy > max_y_global + 1e-3:
-                    max_y_global = cy
-                    highest_xs = [cx]
-                elif abs(cy - max_y_global) <= 1e-3:
-                    highest_xs.append(cx)
-
-        self.x_cut = sum(highest_xs) / len(highest_xs) if highest_xs else 0.0
-        keep_box = box(-9999999.0, -9999999.0, self.x_cut + 0.5, 9999999.0)
-
-        self.cut_lines_info = []
-        cut_geoms = []
-
-        for cl in self.hull_only_centerlines:
-            lo = cl['line']
-            clipped = lo.intersection(keep_box)
-            if clipped.is_empty: continue
-            geoms = [clipped] if clipped.geom_type == 'LineString' else list(
-                clipped.geoms) if clipped.geom_type == 'MultiLineString' else []
-            for g in geoms:
-                if g.length > 1.0:
-                    self.cut_lines_info.append(
-                        {'line_geometry': g, 'thickness': cl.get('thickness', 10.0), 'type': cl.get('type', 'unknown')})
-                    cut_geoms.append(g)
-
-        min_y_global = min([min(g.xy[1]) for g in cut_geoms]) if cut_geoms else -1000.0
-        centerline_boundary = LineString([(self.x_cut, min_y_global - 1000), (self.x_cut, max_y_global + 1000)])
-        self.cut_lines_info.append({'line_geometry': centerline_boundary, 'thickness': 0.0, 'type': 'centerline_wall'})
-        cut_geoms.append(centerline_boundary)
-
-        raw_loops = list(polygonize(cut_geoms))
-        filtered_loops = [poly for poly in raw_loops if poly.area >= 1000.0 and poly.centroid.x < self.x_cut - 10.0]
-
-        AREA_THRESHOLD = 50 * 1000 * 1000
-        global_centroid_y = sum(p.centroid.y * p.area for p in filtered_loops) / sum(
-            p.area for p in filtered_loops) if filtered_loops else 0.0
-        filtered_loops.sort(key=lambda poly: (poly.area >= AREA_THRESHOLD, round(poly.centroid.y, -2),
-                                              -poly.centroid.x if poly.centroid.y < global_centroid_y else poly.centroid.x))
-
-        # 2. 루프 데이터베이스 구축 (공유 격벽 판별 및 노드 생성)
-        self.loop_data = {}
-        for idx, poly in enumerate(filtered_loops):
-            loop_name = f"L{idx + 1}"
-            boundary = poly.boundary
-            segs_in_loop = []
-            loop_nodes = set()
-            for info in self.cut_lines_info:
-                geom = info['line_geometry']
-                if boundary.intersection(geom).length > 1.0:
-                    coords = list(geom.coords)
-                    node_start = (round(coords[0][0], 2), round(coords[0][1], 2))
-                    node_end = (round(coords[-1][0], 2), round(coords[-1][1], 2))
-                    segs_in_loop.append({'line_geometry': geom, 'thickness': info['thickness'], 'type': info['type'],
-                                         'length': geom.length, 'nodes': (node_start, node_end), 'is_shared': False,
-                                         'shared_with': []})
-                    loop_nodes.add(node_start)
-                    loop_nodes.add(node_end)
-            self.loop_data[loop_name] = {'polygon': poly, 'area': poly.area,
-                                         'centroid': (poly.centroid.x, poly.centroid.y), 'segments': segs_in_loop,
-                                         'nodes': list(loop_nodes)}
-
-        loop_names = list(self.loop_data.keys())
-        for i in range(len(loop_names)):
-            for j in range(i + 1, len(loop_names)):
-                name_A, name_B = loop_names[i], loop_names[j]
-                for segA in self.loop_data[name_A]['segments']:
-                    for segB in self.loop_data[name_B]['segments']:
-                        # 허용 오차 내에서 두 부재가 겹치면 공유 격벽으로 판별
-                        if segA['line_geometry'].equals_exact(segB['line_geometry'], 1e-3):
-                            segA['is_shared'] = True
-                            segA['shared_with'].append(name_B)
-                            segB['is_shared'] = True
-                            segB['shared_with'].append(name_A)
-
-        print(f"✅ 폐루프 및 노드 구축 완료 (루프 개수: {len(self.loop_data)}개)")
-        # --- 여기서 연산을 강제 종료하여 흐름/전단류 계산으로 넘어가지 않도록 합니다 ---
-        return
-
     def calculate_determinate_shear_flow(self):
         """
-        [순서도 1 엄격 반영] 정정 전단류(qd) 계산 엔진
-        - 순서도의 변수(nm, vn, vm)와 마름모 분기 조건(vn(j) == nm(j) - 1)을 100% 준수
+        [Step 3] 정정 전단류(Determinate Shear Flow) 계산 엔진
+        - 원본 기하학(Geometry) 루트 유지 및 노드 융합
         """
-        print("\n--- 🚀 Calculating Determinate Shear Flow (qd) [Strict Flowchart 1 Method] ---")
-        import numpy as np
+        print("\n--- 🚀 Calculating Determinate Shear Flow (qs) ---")
+
+        from shapely.ops import substring
         from shapely.geometry import Point, LineString
+        import numpy as np
 
         edges = []
         node_coords = []
 
         def get_node_id(pt):
             for i, n in enumerate(node_coords):
-                if np.hypot(n[0] - pt[0], n[1] - pt[1]) < 1.0: return i
+                if np.hypot(n[0] - pt[0], n[1] - pt[1]) < 1.0:
+                    return i
             node_coords.append((pt[0], pt[1]))
             return len(node_coords) - 1
 
-        # 1. 기하 데이터 추출 (is_cut 플래그 유지)
+        # ✨ [핵심 개편] 시작/끝점만 저장하지 않고, 원본 LineString 루트 전체를 방향 맞춰 저장!
+        def add_edge_geom(geom, thickness, is_forward=True):
+            if geom.length < 1e-3: return
+            coords = list(geom.coords)
+
+            # 흐름 방향이 반대라면, 원본 좌표 배열을 통째로 뒤집어줌
+            if not is_forward:
+                coords = coords[::-1]
+
+            oriented_geom = LineString(coords)
+
+            p_start, p_end = coords[0], coords[-1]
+            n_start = get_node_id(p_start)
+            n_end = get_node_id(p_end)
+
+            edges.append({
+                'start_node': n_start, 'end_node': n_end,
+                'start': node_coords[n_start], 'end': node_coords[n_end],
+                't': thickness,
+                'L': oriented_geom.length,
+                'mid_y': oriented_geom.centroid.y,
+                'geom': oriented_geom  # 💾 원본 부재의 루트(경로)를 통째로 영구 저장!
+            })
+
         loop_geoms = []
+
         if hasattr(self, 'loop_data'):
             for loop_name, data in self.loop_data.items():
                 for seg in data['segments']:
                     geom = seg['line_geometry']
                     t = seg.get('thickness', 10.0)
                     loop_geoms.append(geom)
-                    if geom.length > 1.0:
+
+                    if not ('flow_vec' in seg or seg.get('is_split')):
+                        continue
+
+                    if seg.get('is_split'):
+                        pt = Point(seg['split_pt'])
+                        d_norm = geom.project(pt, normalized=True)
+                        geom1 = substring(geom, 0.0, d_norm, normalized=True)
+                        geom2 = substring(geom, d_norm, 1.0, normalized=True)
+
+                        is_sink = seg.get('is_sink', True)
+                        if is_sink:
+                            add_edge_geom(geom1, t, is_forward=True)
+                            add_edge_geom(geom2, t, is_forward=False)
+                        else:
+                            add_edge_geom(geom1, t, is_forward=False)
+                            add_edge_geom(geom2, t, is_forward=True)
+                    elif 'flow_vec' in seg:
                         coords = list(geom.coords)
-                        edges.append({
-                            'n1': get_node_id(coords[0]), 'n2': get_node_id(coords[-1]),
-                            'id': len(edges), 't': t, 'L': geom.length,
-                            'mid_x': geom.centroid.x, 'mid_y': geom.centroid.y,
-                            'geom': geom, 'is_cut': seg.get('is_split', False)
-                        })
+                        vec = np.array(coords[-1]) - np.array(coords[0])
+                        f_vec = np.array(seg['flow_vec'])
+                        is_forward = np.dot(vec, f_vec) > 0
+                        add_edge_geom(geom, t, is_forward=is_forward)
 
         if hasattr(self, 'hull_only_centerlines'):
             for cl in self.hull_only_centerlines:
                 geom = cl['line']
                 t = cl.get('thickness', 10.0)
+
                 is_open = True
                 for lg in loop_geoms:
                     if geom.distance(lg) < 1e-3 and geom.intersection(lg).length > 1.0:
                         is_open = False
                         break
-                if is_open and geom.length > 1.0:
+
+                if is_open and geom.geom_type == 'LineString' and geom.length > 1.0:
                     coords = list(geom.coords)
-                    edges.append({
-                        'n1': get_node_id(coords[0]), 'n2': get_node_id(coords[-1]),
-                        'id': len(edges), 't': t, 'L': geom.length,
-                        'mid_x': geom.centroid.x, 'mid_y': geom.centroid.y,
-                        'geom': geom, 'is_cut': False
-                    })
+                    p_start, p_end = Point(coords[0]), Point(coords[-1])
 
-        if not edges: return
+                    dist_start = min([p_start.distance(lg) for lg in loop_geoms]) if loop_geoms else 0
+                    dist_end = min([p_end.distance(lg) for lg in loop_geoms]) if loop_geoms else 0
 
-        # 2. 하중 및 수식(1) 파라미터 세팅
-        try:
-            vy_kn = float(self.txt_vy.text())
-        except:
-            vy_kn = 20000.0
+                    is_forward = dist_start > dist_end
+                    add_edge_geom(geom, t, is_forward=is_forward)
 
-        V_y = -(vy_kn * 1000.0)
-        V_x = 0.0
+        if not edges:
+            print("⚠️ [에러] 추출된 엣지가 0개입니다.")
+            return
 
-        xc, yc = self.calc_na_x, self.calc_na_bl
-        Ixx, Iyy, Ixy = self.calc_ixx * 1e12, self.calc_iyy * 1e12, self.calc_ixy * 1e12
-
-        Denom = (Ixx * Iyy) - (Ixy ** 2)
-        if abs(Denom) < 1e-5: Denom = 1e-5
-
-        Lambda_x = (V_y * Iyy - V_x * Ixy) / Denom
-        Lambda_y = (V_x * Ixx - V_y * Ixy) / Denom
+        total_A = sum(e['t'] * e['L'] for e in edges)
+        total_Ay = sum(e['t'] * e['L'] * e['mid_y'] for e in edges)
+        NA_y = total_Ay / total_A if total_A > 0 else 0.0
+        self.NA_y_shear = NA_y
 
         for e in edges:
-            A = e['t'] * e['L']
-            dQ_y = A * (e['mid_x'] - xc)
-            dQ_x = A * (e['mid_y'] - yc)
-            e['DQ'] = - (Lambda_x * dQ_x + Lambda_y * dQ_y)
+            e['dQ'] = e['t'] * e['L'] * (e['mid_y'] - NA_y)
 
-        # 3. 순서도 기반 위상 정렬 탐색
-        nm = {i: 0 for i in range(len(node_coords))}
-        for e in edges:
-            if not e['is_cut']:
-                nm[e['n1']] += 1
-                nm[e['n2']] += 1
-
-        vn = {i: 0 for i in range(len(node_coords))}
-        vm = {m: 0 for m in range(len(edges))}
+        adj = {i: {'in': [], 'out': []} for i in range(len(node_coords))}
+        for i, e in enumerate(edges):
+            adj[e['start_node']]['out'].append(i)
+            adj[e['end_node']]['in'].append(i)
 
         qs_nodes = {i: 0.0 for i in range(len(node_coords))}
-        self.qs_edges = {i: {'start_q': 0.0, 'end_q': 0.0, 'direction': 1} for i in range(len(edges))}
+        qs_edges = {i: {'start_q': 0.0, 'end_q': 0.0} for i in range(len(edges))}
 
-        queue = [i for i in range(len(node_coords)) if nm[i] == 1]
+        in_degree = {i: len(adj[i]['in']) for i in range(len(node_coords))}
+        queue = [i for i in range(len(node_coords)) if in_degree[i] == 0]
 
         while queue:
-            i = queue.pop(0)
-            vn[i] += 1
-            curr_q = qs_nodes[i]
+            curr = queue.pop(0)
+            curr_q = qs_nodes[curr]
 
-            unvisited_members = [idx for idx, e in enumerate(edges)
-                                 if not e['is_cut'] and vm[idx] == 0 and (e['n1'] == i or e['n2'] == i)]
-
-            for m_idx in unvisited_members:
-                e = edges[m_idx]
-                j = e['n2'] if e['n1'] == i else e['n1']
-                flow_dQ = e['DQ'] if e['n1'] == i else -e['DQ']
-
-                end_q = curr_q + flow_dQ
-
-                self.qs_edges[m_idx]['start_q'] = curr_q
-                self.qs_edges[m_idx]['end_q'] = end_q
-                self.qs_edges[m_idx]['direction'] = 1 if e['n1'] == i else -1
-
-                qs_nodes[j] += end_q
-
-                vm[m_idx] += 1
-                vn[j] += 1
-
-                if vn[j] == nm[j] - 1:
-                    queue.append(j)
-
-        self.edges_info = edges
-        self.node_coords = node_coords
-        self.calculate_redundant_shear_flow()
-
-    def calculate_redundant_shear_flow(self):
-        """
-        [Step 4] 반단면 내 폐구간(윙 탱크 등)의 잉여 전단류(qid) 행렬 연산 및 최종 합성
-        (순서도 1 엄격 반영 버전에 맞춘 위상 호환 업데이트)
-        """
-        print("--- 🔄 Calculating Redundant Shear Flow (q_id) Matrix ---")
-        import numpy as np
-
-        edges = self.edges_info
-        cut_members = [e for e in edges if e.get('is_cut')]
-        loops = []
-
-        # 1. 내부 무방향 인접 리스트 생성 (BFS 탐색용)
-        adj = {i: [] for i in range(len(self.node_coords))}
-        for i, e in enumerate(edges):
-            if e.get('is_cut'): continue
-            adj[e['n1']].append((i, e['n2'], 1))
-            adj[e['n2']].append((i, e['n1'], -1))
-
-            # 2. 잘려나간 부재(is_cut)를 복원하며 형성되는 순환 경로(Cycle) 추적 - BFS
-        for cut_edge in cut_members:
-            start_n, target_n = cut_edge['n2'], cut_edge['n1']
-            parent = {}
-            edge_to_parent = {}
-            queue = [start_n]
-            visited = {start_n}
-
-            path_found = False
-            while queue:
-                curr = queue.pop(0)
-                if curr == target_n:
-                    path_found = True
-                    break
-
-                for m_idx, nxt, d in adj.get(curr, []):
-                    if nxt not in visited:
-                        visited.add(nxt)
-                        parent[nxt] = curr
-                        edge_to_parent[nxt] = (m_idx, d)
-                        queue.append(nxt)
-
-            if path_found:
-                curr = target_n
-                path_edges = []
-                while curr != start_n:
-                    m_idx, d = edge_to_parent[curr]
-                    path_edges.append((m_idx, -d))
-                    curr = parent.get(curr)
-
-                # 끊었던 부재를 마지막에 이어 완벽한 루프 생성
-                path_edges.append((cut_edge['id'], 1))
-                loops.append(path_edges)
-
-        N = len(loops)
-        if N == 0:
-            self.shear_edges = edges
-            max_q = max([abs(data['end_q']) for data in self.qs_edges.values()] + [0])
-            msg = f"✅ 대칭 반단면 정정 전단류 완성 (내부 루프 없음)\n- Max 전단류(q): {max_q:.2e} N/mm\n"
-            print(msg)
-            self.result_box.append(msg)
-            return
-
-            # 3. 수식 (3) 행렬 [A] * {q_id} = {B} 조립
-        A_mat = np.zeros((N, N))
-        B_vec = np.zeros(N)
-
-        for i, loop_i in enumerate(loops):
-            for edge_idx, dir_i in loop_i:
+            for edge_idx in adj[curr]['out']:
                 e = edges[edge_idx]
-                ds_t = e['L'] / e['t']
-                A_mat[i, i] += ds_t
+                qs_edges[edge_idx]['start_q'] = curr_q
 
-                # 정정 전단류 평균값
-                avg_qd = (self.qs_edges[edge_idx]['start_q'] + self.qs_edges[edge_idx]['end_q']) / 2.0
-                B_vec[i] -= dir_i * avg_qd * ds_t
+                end_q = curr_q + e['dQ']
+                qs_edges[edge_idx]['end_q'] = end_q
 
-            for j in range(i + 1, N):
-                loop_j = loops[j]
-                for edge_idx_i, dir_i in loop_i:
-                    for edge_idx_j, dir_j in loop_j:
-                        if edge_idx_i == edge_idx_j:
-                            A_mat[i, j] += dir_i * dir_j * (edges[edge_idx_i]['L'] / edges[edge_idx_i]['t'])
-                A_mat[j, i] = A_mat[i, j]
+                nxt = e['end_node']
+                qs_nodes[nxt] += end_q
 
-        # 4. 잉여 전단류 해 찾기
-        try:
-            q0_vector = np.linalg.solve(A_mat, B_vec)
-        except np.linalg.LinAlgError:
-            self.shear_edges = edges
-            msg = "⚠️ 내부 루프 행렬이 특이행렬입니다. 정정 전단류만 표출합니다.\n"
-            print(msg)
-            self.result_box.append(msg)
-            return
+                in_degree[nxt] -= 1
+                if in_degree[nxt] == 0:
+                    queue.append(nxt)
 
-        # 5. 최종 전단류 합성: q = q_d + q_id
-        for i, loop_i in enumerate(loops):
-            for edge_idx, dir_i in loop_i:
-                q0_val = dir_i * q0_vector[i]
-                self.qs_edges[edge_idx]['start_q'] += q0_val
-                self.qs_edges[edge_idx]['end_q'] += q0_val
-
-                # 합성 후 진짜 흐름 방향 재평가 (시각화 화살표용)
-                q_avg = (self.qs_edges[edge_idx]['start_q'] + self.qs_edges[edge_idx]['end_q']) / 2.0
-                self.qs_edges[edge_idx]['direction'] = 1 if q_avg >= 0 else -1
-
-                if edges[edge_idx].get('is_cut'):
-                    edges[edge_idx]['is_cut'] = False
-
+        self.qs_edges = qs_edges
         self.shear_edges = edges
-        max_q = max([abs(data['end_q']) for data in self.qs_edges.values()] + [0])
-        msg = f"✅ 내부 다중셀(윙탱크 등) 잉여 전단류(q_id) 보정 완료!\n- Max 전단류(q): {max_q:.2e} N/mm\n"
-        print(msg)
-        self.result_box.append(msg)
+
+        max_q = max([abs(data['end_q']) for data in qs_edges.values()] + [0])
+        print(f"✅ 정정 전단류 계산 완료! (전체 부재: {len(edges)}개, 통합 중립축: {NA_y:.2f}mm, Max Q: {max_q:.2e})")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
