@@ -11,6 +11,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pdfplumber
 import re
+
+import progress
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, \
     NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
