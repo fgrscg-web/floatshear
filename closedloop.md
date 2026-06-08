@@ -1925,7 +1925,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 drawn_segments.add(geom_id)
 
                 # ==========================================
-                # ✨ (4) 시각화 요소 마커 처리 및 노드(Nodes) 렌더링
+                # ✨ (4) 시각화 요소 마커 처리, 노드(Nodes) ID 부여 및 렌더링
                 # ==========================================
                 bridge_nodes, slit_nodes, normal_nodes = [], [], []
 
@@ -1964,7 +1964,8 @@ class UltimateShipAnalyzer(QMainWindow):
 
                             if info.get('flow_vec') is not None:
                                 c = list(info['line_geometry'].coords)
-                                is_fwd = np.dot(np.array(c[-1]) - np.array(c[0]), np.array(info['flow_vec'])) > 0
+                                is_fwd = np.dot(np.array(c[-1]) - np.array(c[0]),
+                                                np.array(info['flow_vec'])) > 0
                                 pt_is_start = np.hypot(c[0][0] - pt[0], c[0][1] - pt[1]) < 1.0
 
                                 is_flow_in = False
@@ -1990,19 +1991,56 @@ class UltimateShipAnalyzer(QMainWindow):
                     if not any(np.hypot(vs[0] - sn[0], vs[1] - sn[1]) < 1.0 for sn in slit_nodes):
                         slit_nodes.append(vs)
 
-                if bridge_nodes: ax2.scatter([n[0] for n in bridge_nodes], [n[1] for n in bridge_nodes], color='purple',
-                                             marker='s', s=55, zorder=30, label='Bridge Node (Deg≥3)')
-                if slit_nodes: ax2.scatter([n[0] for n in slit_nodes], [n[1] for n in slit_nodes], color='red',
-                                           marker='^', s=100, zorder=31, label='Slit Node (Non-Open IN)')
-                if open_nodes: ax2.scatter([n[0] for n in open_nodes], [n[1] for n in open_nodes], color='dodgerblue',
-                                           marker='o', s=45, zorder=29, label='Open Node (Deg=1)')
-                if normal_nodes: ax2.scatter([n[0] for n in normal_nodes], [n[1] for n in normal_nodes], color='gray',
-                                             marker='o', s=20, zorder=28, label='Normal Node')
+                # ==========================================
+                # ✨ ID 할당 및 UI 시각화 텍스트 출력 로직
+                # ==========================================
+                current_id = 1
 
-                if l1_start_pt: ax2.scatter(l1_start_pt.x, l1_start_pt.y, color='green', marker='o', s=100, zorder=26,
-                                            label='Global Flow Start')
+                # 마커와 겹치지 않게 약간 우측 상단으로 띄워서 텍스트를 그리는 도우미 함수
+                def draw_id_label(ax, x, y, text, color):
+                    ax.annotate(text, (x, y), xytext=(5, 5), textcoords='offset points',
+                                color=color, fontsize=9, fontweight='bold',
+                                bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=1),
+                                zorder=35)
+
+                if bridge_nodes:
+                    ax2.scatter([n[0] for n in bridge_nodes], [n[1] for n in bridge_nodes],
+                                color='purple', marker='s', s=55, zorder=30,
+                                label='Bridge Node (Deg≥3)')
+                    for n in bridge_nodes:
+                        draw_id_label(ax2, n[0], n[1], f"{current_id}, {current_id + 1}", 'purple')
+                        current_id += 2
+
+                if slit_nodes:
+                    ax2.scatter([n[0] for n in slit_nodes], [n[1] for n in slit_nodes], color='red',
+                                marker='^', s=100, zorder=31, label='Slit Node (Non-Open IN)')
+                    for n in slit_nodes:
+                        draw_id_label(ax2, n[0], n[1], f"{current_id}, {current_id + 1}", 'red')
+                        current_id += 2
+
+                if open_nodes:
+                    ax2.scatter([n[0] for n in open_nodes], [n[1] for n in open_nodes],
+                                color='dodgerblue', marker='o', s=45, zorder=29,
+                                label='Open Node (Deg=1)')
+                    for n in open_nodes:
+                        draw_id_label(ax2, n[0], n[1], f"{current_id}", 'dodgerblue')
+                        current_id += 1
+
+                if normal_nodes:
+                    ax2.scatter([n[0] for n in normal_nodes], [n[1] for n in normal_nodes],
+                                color='gray', marker='o', s=20, zorder=28, label='Normal Node')
+                    for n in normal_nodes:
+                        draw_id_label(ax2, n[0], n[1], f"{current_id}", 'gray')
+                        current_id += 1
+
+                if l1_start_pt:
+                    ax2.scatter(l1_start_pt.x, l1_start_pt.y, color='green', marker='o', s=100,
+                                zorder=26, label='Global Flow Start')
+                    draw_id_label(ax2, l1_start_pt.x, l1_start_pt.y, f"{current_id}, {current_id + 1}",
+                                  'green')
+                    current_id += 2
+
                 ax2.legend(loc='upper right')
-                # 캔버스 업데이트 (정정 전단류 계산 과정 제거됨)
             ax2.figure.canvas.draw()
 
             if 'progress' in locals():
