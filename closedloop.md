@@ -1561,9 +1561,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 virtual_slits = set()
                 processed_pairs = set()
 
-                # ---------------------------------------------------------
-                # (1) 모든 공유 격벽 병합 및 엄선된 단일 가상 슬릿(정중앙) 배치
-                # ---------------------------------------------------------
+                # 1. 1차 슬릿 배정 (공유 격벽 기준)
                 for loop_name, data in self.loop_data.items():
                     if data['area'] >= AREA_THRESHOLD: continue
 
@@ -1575,7 +1573,6 @@ class UltimateShipAnalyzer(QMainWindow):
                                 pair = tuple(sorted([loop_name, other_loop]))
                                 if pair not in processed_pairs:
                                     processed_pairs.add(pair)
-
                                     shared_geoms = [s['line_geometry'] for s in data['segments'] if
                                                     other_loop in s['shared_with']]
                                     if shared_geoms:
@@ -1588,102 +1585,137 @@ class UltimateShipAnalyzer(QMainWindow):
                                         slit_map[pair] = mid_pt
                                         virtual_slits.add((round(mid_pt.x, 3), round(mid_pt.y, 3)))
 
-                # ---------------------------------------------------------
-                # L1의 Global Flow Start (수직 부재 중앙) 미리 탐색
-                # ---------------------------------------------------------
+                # ✨ 2. [요구사항 1] 시작점(Start Point) 설정: L1의 가장 왼쪽 수직 선분 중앙
                 l1_start_pt = None
-                if 'L1' in self.loop_data and self.loop_data['L1']['area'] < AREA_THRESHOLD:
-                    outer_segs = [s for s in self.loop_data['L1']['segments'] if not s['is_shared']]
-                    vert_segs = [s for s in outer_segs if abs(
-                        list(s['line_geometry'].coords)[-1][1] - list(s['line_geometry'].coords)[0][
-                            1]) > abs(
-                        list(s['line_geometry'].coords)[-1][0] - list(s['line_geometry'].coords)[0][0])]
+                start_degree = 0
+
+                if 'L1' in self.loop_data:
+                    l1_segs = self.loop_data['L1']['segments']
+                    outer_segs = [s for s in l1_segs if not s['is_shared']]
+
+                    # 수직 방향성을 띠는 외곽 선분들만 필터링
+                    vert_segs = [s for s in outer_segs if
+                                 abs(s['nodes'][0][1] - s['nodes'][1][1]) > abs(s['nodes'][0][0] - s['nodes'][1][0])]
+
                     if vert_segs:
-                        max_x = max(s['line_geometry'].bounds[2] for s in vert_segs)
-                        outer_max_x = [s['line_geometry'] for s in vert_segs if
-                                       abs(s['line_geometry'].bounds[2] - max_x) < 10.0]
-                        if outer_max_x:
-                            merged = linemerge(outer_max_x)
-                            if merged.geom_type == 'MultiLineString': merged = max(list(merged.geoms),
-                                                                                   key=lambda
-                                                                                       x: x.length)
-                            l1_start_pt = merged.interpolate(0.5, normalized=True)
+                        # 전체 수직 선분 중 가장 왼쪽(최소 X) 좌표 탐색
+                        min_x = min(s['line_geometry'].bounds[0] for s in vert_segs)
 
-                # ---------------------------------------------------------
-                # ✨ 슬릿 갯수와 폐루프 갯수 비교 및 부족분 딱 1개 추가 (디버그 포함)
-                # ---------------------------------------------------------
-                num_loops = sum(1 for d in self.loop_data.values())
+                        # 가장 왼쪽 축 상에 겹치는 조각난 선분들을 모두 수집 (오차 10.0mm 허용)
+                        leftmost_geoms = [s['line_geometry'] for s in vert_segs if
+                                          abs(s['line_geometry'].bounds[0] - min_x) < 10.0]
 
-                # l1_start_pt는 선분을 반으로 가르는 역할을 하므로 사실상 Degree=2 와 동일한 역할
-                start_degree = 2 if l1_start_pt is not None else 0
+                        if leftmost_geoms:
+                            # 쪼개진 선분들을 linemerge를 통해 '하나의 온전한 변'으로 병합
+                            merged_side = linemerge(leftmost_geoms)
+                            # 만약 완벽히 닿지 않아 MultiLineString이 되었다면 가장 긴 덩어리를 채택
+                            if merged_side.geom_type == 'MultiLineString':
+                                merged_side = max(list(merged_side.geoms), key=lambda x: x.length)
 
-                num_slits = len(virtual_slits)
-                effective_slits = num_slits
+                            # '하나의 온전한 변'의 정중앙에 스타트 포인트 할당
+                            l1_start_pt = merged_side.interpolate(0.5, normalized=True)
+                            start_degree = 2
+
+                    # 만약 외곽에 수직 선분이 아예 없다면 최좌측 선분들 병합을 대안으로 사용
+                    elif outer_segs:
+                        min_x = min(s['line_geometry'].bounds[0] for s in outer_segs)
+                        leftmost_geoms = [s['line_geometry'] for s in outer_segs if
+                                          abs(s['line_geometry'].bounds[0] - min_x) < 10.0]
+                        if leftmost_geoms:
+                            merged_side = linemerge(leftmost_geoms)
+                            if merged_side.geom_type == 'MultiLineString':
+                                merged_side = max(list(merged_side.geoms), key=lambda x: x.length)
+                            l1_start_pt = merged_side.interpolate(0.5, normalized=True)
+                            start_degree = 2
+
+                # ✨ 3. 전체 루프 갯수와 모든 슬릿(UI 기준 삼각형) 갯수 비교
+                num_loops = len(self.loop_data)
+
+                # 구조적 위상 슬릿 (UI 렌더링 기준) 갯수 산정
+                loop_geom_ids = set()
+                for data in self.loop_data.values():
+                    for seg in data['segments']:
+                        loop_geom_ids.add(id(seg['line_geometry']))
+
+                ui_slit_nodes = []
+                for pt, lines in global_node_map.items():
+                    if pt[0] > filter_limit: continue
+                    degree = len(lines)
+                    if degree >= 3:
+                        has_loop = False
+                        requires_slit = False
+                        for info in lines:
+                            is_loop_seg = id(info['line_geometry']) in loop_geom_ids
+                            if is_loop_seg:
+                                has_loop = True
+                            else:
+                                dist_to_n1 = np.hypot(info['n1'][0] - pt[0], info['n1'][1] - pt[1])
+                                other_n = info['n2'] if dist_to_n1 < 1.0 else info['n1']
+                                other_degree = len(global_node_map.get(other_n, []))
+                                if other_degree != 1:
+                                    requires_slit = True
+                        if has_loop and requires_slit:
+                            ui_slit_nodes.append(pt)
+
+                for vs in virtual_slits:
+                    if vs[0] > filter_limit: continue
+                    if not any(
+                            np.hypot(vs[0] - sn[0], vs[1] - sn[1]) < 1.0 for sn in ui_slit_nodes):
+                        ui_slit_nodes.append(vs)
+
+                effective_slits = len(ui_slit_nodes)
                 is_start_slit_added = False
 
-                # 스타트포인트 디그리가 2 이상이면 가상 슬릿 역할을 하므로 개수 + 1
+                # 스타트포인트 디그리가 2 이상이면서 기존 슬릿 목록에 포함되지 않았다면 보정 (+1)
                 if start_degree >= 2:
-                    effective_slits += 1
-                    is_start_slit_added = True
+                    if l1_start_pt and not any(
+                            np.hypot(l1_start_pt.x - sn[0], l1_start_pt.y - sn[1]) < 1.0 for sn in
+                            ui_slit_nodes):
+                        effective_slits += 1
+                        is_start_slit_added = True
 
-                # 파이참 콘솔창에 로그를 띄워 어떻게 판별되었는지 확인 가능합니다.
                 print("\n==================================================")
                 print(f"🔍 [DEBUG] 위상 및 슬릿 분석 현황")
                 print(f" - 전체 폐루프(Loop) 갯수 : {num_loops}")
-                print(f" - 공유 격벽 슬릿 갯수    : {num_slits}")
-                print(f" - 시작점 슬릿(+1) 보정   : {is_start_slit_added} (Start Degree: {start_degree})")
-                print(f" - 최종 유효 슬릿 갯수    : {effective_slits}")
+                print(f" - 공유 격벽 슬릿 갯수    : {len(virtual_slits)}")
+                print(f" - 구조적 UI 슬릿 갯수    : {len(ui_slit_nodes)}")
+                print(f" - 시작점 분기 슬릿 보정  : {is_start_slit_added} (Start Degree: {start_degree})")
+                print(f" - 최종 유효 총 슬릿 갯수 : {effective_slits}")
                 print("==================================================")
 
                 extra_slits_map = {}
 
+                # ✨ [요구사항 2] 슬릿이 부족할 경우, 마지막 루프의 가장 오른쪽 선분 중앙에 강제 추가
                 if effective_slits < num_loops:
-                    print(f"⚠️ 슬릿 부족 판정! ({effective_slits} < {num_loops}) -> 중심선 강제 슬릿 생성 시도...")
-                    slit_added_success = False
+                    print(
+                        f"⚠️ 총 슬릿 부족 판정! ({effective_slits} < {num_loops}) -> 마지막 루프의 '가장 오른쪽 선분' 탐색 시도...")
 
-                    for idx, poly in enumerate(filtered_loops):
-                        loop_name = f"L{idx + 1}"
-                        if self.loop_data[loop_name]['area'] >= AREA_THRESHOLD: continue
+                    # 마지막 루프 식별 (번호가 가장 큰 루프, 예: L6)
+                    target_loop = max(self.loop_data.keys(), key=lambda k: int(k[1:]))
+                    l_segs = self.loop_data[target_loop]['segments']
 
-                        l_segs = self.loop_data[loop_name]['segments']
-                        adj_loops = set(ol for s in l_segs if s['is_shared'] for ol in s['shared_with'] if self.loop_data[ol]['area'] < AREA_THRESHOLD)
-                        next_loops = [ol for ol in adj_loops if int(ol[1:]) > idx + 1]
+                    # 외부와 맞닿은(공유되지 않은) 선분 중 가장 오른쪽(최대 X) 선분 찾기
+                    outer_segs = [s for s in l_segs if not s['is_shared']]
+                    if not outer_segs:
+                        outer_segs = l_segs  # 예외 상황 대비 안전 장치
 
-                        if not next_loops:
-                            print(f" -> 터미널 루프 발견: {loop_name}")
-                            centerline_segs = []
-                            for s in l_segs:
-                                if not s['is_shared']:
-                                    n1, n2 = s['nodes']
-                                    if abs(n1[0] - x_cut) < 5.0 or abs(n2[0] - x_cut) < 5.0:
-                                        centerline_segs.append(s)
+                    rightmost_seg = max(outer_segs,
+                                        key=lambda s: max(s['nodes'][0][0], s['nodes'][1][0]))
+                    geom = rightmost_seg['line_geometry']
+                    mid_pt = geom.interpolate(0.5, normalized=True)
 
-                            if centerline_segs:
-                                top_seg = max(centerline_segs, key=lambda s: max(s['nodes'][0][1], s['nodes'][1][1]))
-                                geom = top_seg['line_geometry']
-                                mid_pt = geom.interpolate(0.5, normalized=True)
+                    virtual_slits.add((round(mid_pt.x, 3), round(mid_pt.y, 3)))
+                    extra_slits_map[target_loop] = mid_pt
 
-                                virtual_slits.add((round(mid_pt.x, 3), round(mid_pt.y, 3)))
-                                extra_slits_map[loop_name] = mid_pt
-                                slit_added_success = True
-                                print(f" -> ✅ {loop_name} 부재 중심선(x={round(mid_pt.x, 2)}, y={round(mid_pt.y, 2)})에 슬릿 추가 완료!")
-                                break
-                            else:
-                                print(f" -> ❌ {loop_name} 내부에서 중심선(x={x_cut})과 5.0mm 이내로 맞닿은 선분을 찾지 못했습니다.")
-
-                    if not slit_added_success:
-                        print("❌ 최종 실패: 강제 슬릿을 추가할 적절한 위치를 도면에서 찾지 못했습니다.")
+                    print(
+                        f" -> ✅ {target_loop} 부재의 가장 오른쪽 선분 중앙(x={round(mid_pt.x, 2)}, y={round(mid_pt.y, 2)})에 강제 슬릿을 생성했습니다!")
                 else:
-                    print("✅ 슬릿이 충분하여 중심선에 강제 슬릿을 추가하지 않습니다.")
+                    print("✅ 총 슬릿이 루프 갯수 이상이므로, 강제 슬릿을 추가하지 않습니다.")
 
-                # ---------------------------------------------------------
-                # (2) 링(Ring) 기반의 위상 수학적 흐름 라우팅 (방향 분배)
-                # ---------------------------------------------------------
                 drawn_segments = set()
 
                 def in_interval(d, s, e):
-                    if s <= e: return s <= d <= e
-                    return d >= s or d <= e
+                    return s <= d <= e if s <= e else (d >= s or d <= e)
 
                 def draw_split_flow(geom, pt, is_sink, seg):
                     d_pt = geom.project(pt, normalized=True)
@@ -1691,60 +1723,68 @@ class UltimateShipAnalyzer(QMainWindow):
                         pt1 = geom.interpolate(d_pt / 2.0, normalized=True)
                         pt2 = geom.interpolate((1.0 + d_pt) / 2.0, normalized=True)
 
-                        coords = list(geom.coords)
-                        seg_vec = np.array(coords[-1]) - np.array(coords[0])
-                        u_vec = seg_vec / np.linalg.norm(seg_vec)
+                        c_list = list(geom.coords)
+                        dx = c_list[-1][0] - c_list[0][0]
+                        dy = c_list[-1][1] - c_list[0][1]
+                        L = np.hypot(dx, dy)
+                        if L < 1e-6: return False
+                        ux, uy = dx / L, dy / L
 
-                        c = np.array([pt.x, pt.y])
+                        # 스칼라 연산 직접 수행 (넘파이 충돌 에러 우회)
+                        vx1, vy1 = pt1.x - pt.x, pt1.y - pt.y
+                        dot1 = vx1 * ux + vy1 * uy
+                        f1_x, f1_y = (ux, uy) if dot1 > 0 else (-ux, -uy)
+                        if not is_sink: f1_x, f1_y = -f1_x, -f1_y
 
-                        # ✨ 슬릿(pt)에서 바깥으로 무조건 나가도록(OUT) 방향 벡터 설정
-                        dir_to_pt1 = np.array([pt1.x, pt1.y]) - c
-                        f1 = u_vec if np.dot(dir_to_pt1, u_vec) > 0 else -u_vec
-                        if not is_sink: f1 = -f1
+                        vx2, vy2 = pt2.x - pt.x, pt2.y - pt.y
+                        dot2 = vx2 * ux + vy2 * uy
+                        f2_x, f2_y = (ux, uy) if dot2 > 0 else (-ux, -uy)
+                        if not is_sink: f2_x, f2_y = -f2_x, -f2_y
 
-                        dir_to_pt2 = np.array([pt2.x, pt2.y]) - c
-                        f2 = u_vec if np.dot(dir_to_pt2, u_vec) > 0 else -u_vec
-                        if not is_sink: f2 = -f2
-
-                        ax2.quiver(pt1.x, pt1.y, f1[0], f1[1], color='blue', scale=20, width=0.005,
+                        ax2.quiver(pt1.x, pt1.y, f1_x, f1_y, color='blue', scale=20, width=0.005,
                                    headwidth=5, pivot='mid', zorder=20)
-                        ax2.quiver(pt2.x, pt2.y, f2[0], f2[1], color='blue', scale=20, width=0.005,
+                        ax2.quiver(pt2.x, pt2.y, f2_x, f2_y, color='blue', scale=20, width=0.005,
                                    headwidth=5, pivot='mid', zorder=20)
-
-                        seg['is_split'] = True
-                        seg['split_pt'] = (pt.x, pt.y)
-                        seg['is_sink'] = is_sink
-
-                        if 'info_ref' in seg:
-                            seg['info_ref']['is_split'] = True
-
+                        seg['is_split'], seg['split_pt'], seg['is_sink'] = True, (pt.x,
+                                                                                  pt.y), is_sink
+                        if 'info_ref' in seg: seg['info_ref']['is_split'] = True
                         return True
                     return False
 
+                # 4. 루프 내 전단류 방향 라우팅 (추가된 슬릿 반영 및 흐름 재분배)
                 for idx, poly in enumerate(filtered_loops):
                     loop_name = f"L{idx + 1}"
-                    if self.loop_data[loop_name]['area'] >= AREA_THRESHOLD: continue
+                    if loop_name not in self.loop_data: continue
+
+                    # 원래는 AREA_THRESHOLD로 필터링되나, 강제 슬릿이 부여된 대형 루프는 예외적으로 방향 라우팅에 포함합니다.
+                    if self.loop_data[loop_name][
+                        'area'] >= AREA_THRESHOLD and loop_name not in extra_slits_map:
+                        continue
 
                     l_segs = self.loop_data[loop_name]['segments']
                     ring = self.loop_data[loop_name]['polygon'].exterior
                     L_ring = ring.length
 
-                    adj_loops = set(ol for s in l_segs if s['is_shared'] for ol in s['shared_with'] if
-                                    self.loop_data[ol]['area'] < AREA_THRESHOLD)
+                    adj_loops = set(ol for s in l_segs if s['is_shared'] for ol in s['shared_with'])
                     prev_loops = [ol for ol in adj_loops if int(ol[1:]) < idx + 1]
                     next_loops = [ol for ol in adj_loops if int(ol[1:]) > idx + 1]
 
                     prev_loop = max(prev_loops, key=lambda x: int(x[1:])) if prev_loops else None
                     next_loop = min(next_loops, key=lambda x: int(x[1:])) if next_loops else None
 
-                    # 라우팅 기준점(target_pt) 설정 시 중심선 강제 추가 슬릿 우선 적용
                     if next_loop:
                         target_pt = slit_map.get(tuple(sorted([loop_name, next_loop])))
                     else:
                         if loop_name in extra_slits_map:
                             target_pt = extra_slits_map[loop_name]
                         else:
-                            target_pt = Point(max(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
+                            target_pt = Point(
+                                max(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
+
+                    # 슬릿 부재 예외처리 안전장치
+                    if target_pt is None:
+                        target_pt = Point(
+                            max(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
 
                     d_tgt = ring.project(target_pt)
 
@@ -1755,23 +1795,30 @@ class UltimateShipAnalyzer(QMainWindow):
                         d_start = ring.project(l1_start_pt)
                     elif prev_loop:
                         slit_prev = slit_map.get(tuple(sorted([loop_name, prev_loop])))
-                        d_ps = ring.project(slit_prev)
-
-                        prev_geoms = [s['line_geometry'] for s in l_segs if
-                                      prev_loop in s['shared_with']]
-                        merged_prev = linemerge(prev_geoms)
-                        if merged_prev.geom_type == 'MultiLineString': merged_prev = max(
-                            list(merged_prev.geoms), key=lambda x: x.length)
-
-                        nA = Point(merged_prev.coords[0])
-                        nB = Point(merged_prev.coords[-1])
-                        d_nA = ring.project(nA)
-                        d_nB = ring.project(nB)
-
-                        if (d_nA - d_ps) % L_ring < (d_nB - d_ps) % L_ring:
-                            d_nr, d_nl = d_nA, d_nB
+                        if slit_prev is None:
+                            d_start = ring.project(Point(
+                                min(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1])))
+                            is_l1 = True
                         else:
-                            d_nr, d_nl = d_nB, d_nA
+                            d_ps = ring.project(slit_prev)
+                            prev_geoms = [s['line_geometry'] for s in l_segs if
+                                          prev_loop in s['shared_with']]
+                            if prev_geoms:
+                                merged_prev = linemerge(prev_geoms)
+                                if merged_prev.geom_type == 'MultiLineString': merged_prev = max(
+                                    list(merged_prev.geoms), key=lambda x: x.length)
+
+                                d_nA = ring.project(Point(merged_prev.coords[0]))
+                                d_nB = ring.project(Point(merged_prev.coords[-1]))
+
+                                if (d_nA - d_ps) % L_ring < (d_nB - d_ps) % L_ring:
+                                    d_nr, d_nl = d_nA, d_nB
+                                else:
+                                    d_nr, d_nl = d_nB, d_nA
+                            else:
+                                d_start = ring.project(Point(
+                                    min(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1])))
+                                is_l1 = True
                     else:
                         lowest_node = Point(
                             min(self.loop_data[loop_name]['nodes'], key=lambda pt: pt[1]))
@@ -1782,27 +1829,25 @@ class UltimateShipAnalyzer(QMainWindow):
                         geom = seg['line_geometry']
                         geom_id = id(geom)
 
-                        if geom_id in drawn_segments:
-                            continue
+                        if geom_id in drawn_segments: continue
 
                         if seg.get('flow_vec') is not None:
                             drawn_segments.add(geom_id)
                             mid = geom.interpolate(0.5, normalized=True)
-                            ax2.quiver(mid.x, mid.y, seg['flow_vec'][0], seg['flow_vec'][1], color='dodgerblue', scale=20, width=0.005, headwidth=5, pivot='mid', zorder=20)
+                            ax2.quiver(mid.x, mid.y, seg['flow_vec'][0], seg['flow_vec'][1],
+                                       color='dodgerblue', scale=20, width=0.005, headwidth=5,
+                                       pivot='mid', zorder=20)
                             continue
 
                         handled = False
-
                         if target_pt and geom.distance(target_pt) < 1.0 and geom.length > 2.0:
-                            if draw_split_flow(geom, target_pt, True, seg): handled = True
-
+                            handled = draw_split_flow(geom, target_pt, True, seg)
                         elif not is_l1 and slit_prev and geom.distance(
                                 slit_prev) < 1.0 and geom.length > 2.0:
-                            if draw_split_flow(geom, slit_prev, False, seg): handled = True
-
+                            handled = draw_split_flow(geom, slit_prev, False, seg)
                         elif is_l1 and l1_start_pt and geom.distance(
                                 l1_start_pt) < 1.0 and geom.length > 2.0:
-                            if draw_split_flow(geom, l1_start_pt, False, seg): handled = True
+                            handled = draw_split_flow(geom, l1_start_pt, False, seg)
 
                         if handled:
                             drawn_segments.add(geom_id)
@@ -1812,14 +1857,19 @@ class UltimateShipAnalyzer(QMainWindow):
                         mid_pt = geom.interpolate(0.5, normalized=True)
                         d_m = ring.project(mid_pt)
 
-                        coords = list(geom.coords)
-                        seg_vec = np.array(coords[-1]) - np.array(coords[0])
-                        if np.linalg.norm(seg_vec) < 1e-6: continue
-                        u_vec = seg_vec / np.linalg.norm(seg_vec)
+                        c_list = list(geom.coords)
+                        dx = c_list[-1][0] - c_list[0][0]
+                        dy = c_list[-1][1] - c_list[0][1]
+                        L = np.hypot(dx, dy)
+                        if L < 1e-6: continue
+                        ux, uy = dx / L, dy / L
 
                         p_next = ring.interpolate((d_m + 1.0) % L_ring)
-                        ring_fwd = np.array([p_next.x - mid_pt.x, p_next.y - mid_pt.y])
-                        forward_u_vec = u_vec if np.dot(u_vec, ring_fwd) > 0 else -u_vec
+                        rx = p_next.x - mid_pt.x
+                        ry = p_next.y - mid_pt.y
+
+                        dot_fwd = ux * rx + uy * ry
+                        f_x, f_y = (ux, uy) if dot_fwd > 0 else (-ux, -uy)
 
                         if is_l1:
                             dir_sign = 1 if in_interval(d_m, d_start, d_tgt) else -1
@@ -1833,21 +1883,18 @@ class UltimateShipAnalyzer(QMainWindow):
                             else:
                                 dir_sign = 1
 
-                        # ✨ 추가된 슬릿이 있는 루프에서는 슬릿에서 빠져나가도록 방향 반전 재분배
+                        # 새로 추가된 강제 슬릿이 있는 루프는 흐름이 "빠져나가도록" 전체 방향 반전
                         if loop_name in extra_slits_map:
-                            flow_vec = forward_u_vec * (-dir_sign)
-                        else:
-                            flow_vec = forward_u_vec * dir_sign
+                            dir_sign = -dir_sign
 
-                        seg['flow_vec'] = (flow_vec[0], flow_vec[1])
-                        seg['is_split'] = False
+                        flow_vec = (f_x * dir_sign, f_y * dir_sign)
+                        seg['flow_vec'] = flow_vec
 
                         if 'info_ref' in seg:
-                            seg['info_ref']['flow_vec'] = seg['flow_vec']
+                            seg['info_ref']['flow_vec'] = flow_vec
 
-                        ax2.quiver(mid_pt.x, mid_pt.y, flow_vec[0], flow_vec[1], color='blue', scale=20,
-                                   width=0.005, headwidth=5, pivot='mid', zorder=20)
-
+                        ax2.quiver(mid_pt.x, mid_pt.y, flow_vec[0], flow_vec[1], color='blue',
+                                   scale=20, width=0.005, headwidth=5, pivot='mid', zorder=20)
                 # 열린 선분 및 남은 찌꺼기 선분 (Open & Fallback Segments)
                 for info in cut_lines_info:
                     if info['type'] == 'centerline_wall': continue
